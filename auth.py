@@ -10,6 +10,7 @@ Workflow
 """
 
 import os
+import re
 import sqlite3
 
 import bcrypt
@@ -17,6 +18,34 @@ import pandas as pd
 
 DB_PATH = os.path.join("data", "employees.db")
 EXCEL_PATH = os.path.join("data", "employees.xlsx")
+
+# Small, curated facts that complement the PDF policy library.  They live in
+# SQLite so the assistant can answer operational questions without requiring a
+# vector-store rebuild for every update.
+KNOWLEDGE_SEED = [
+    ("it_support", "IT support", "For password, VPN, laptop, or access issues, open a ticket in the Service Desk portal. Critical account lockouts are handled by the IT Help Desk during business hours."),
+    ("expenses", "Expense reimbursement", "Submit receipts and the completed expense report within 30 days of the purchase. Your manager must approve the report before Finance processes reimbursement."),
+    ("payroll", "Payroll schedule", "NovaCorp pays employees monthly on the final business day. Questions about a payslip should be sent to Payroll through the HR service desk."),
+    ("learning", "Learning and development", "Employees can request role-relevant training through their manager. Approved courses are recorded in the learning portal and reimbursed according to the approved budget."),
+]
+
+
+def ensure_knowledge_base() -> None:
+    """Create and seed the RAG knowledge table without modifying login data."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rag_knowledge (
+            key TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL
+        )
+    """)
+    conn.executemany(
+        "INSERT OR IGNORE INTO rag_knowledge (key, title, content) VALUES (?, ?, ?)",
+        KNOWLEDGE_SEED,
+    )
+    conn.commit()
+    conn.close()
 
 
 # ── Database initialisation ──────────────────────────────────────────────────
@@ -74,6 +103,7 @@ def init_db() -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_emp_id ON employees(id)")
     conn.commit()
     conn.close()
+    ensure_knowledge_base()
     print(f"✅ Loaded {len(df)} employees into SQLite → {DB_PATH}")
 
 
@@ -112,6 +142,31 @@ def get_employee(employee_id: str) -> dict | None:
     ).fetchone()
     conn.close()
     return _row_to_dict(row) if row else None
+
+
+def search_knowledge(query: str, limit: int = 3) -> list[dict]:
+    """Return relevant curated knowledge rows from SQLite for a RAG tool."""
+    if not os.path.exists(DB_PATH):
+        return []
+    # Keep only lexical words so punctuation in normal chat questions (for
+    # example "support?") does not prevent a SQLite LIKE match.
+    terms = [term for term in re.findall(r"[a-z0-9]+", query.lower()) if len(term) > 2]
+    if not terms:
+        return []
+    clauses = " OR ".join("lower(title || ' ' || content) LIKE ?" for _ in terms)
+    params = [f"%{term}%" for term in terms] + [limit]
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            f"SELECT key, title, content FROM rag_knowledge WHERE {clauses} LIMIT ?",
+            params,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []  # Database created by an older version; seed it on next init.
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
 
 
 if __name__ == "__main__":

@@ -11,7 +11,11 @@ Components
 """
 
 import os
-from typing import Optional
+import json
+import re
+import sqlite3
+from dataclasses import dataclass
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 
@@ -25,6 +29,9 @@ from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.retrievers import BM25Retriever
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_ollama import ChatOllama
+
+from auth import DB_PATH
 
 load_dotenv()
 
@@ -154,13 +161,20 @@ def create_hybrid_retriever(
 def get_llm(
     model: str = "models/gemini-2.5-flash",
     temperature: float = 0.3,
-) -> ChatGoogleGenerativeAI:
-    return ChatGoogleGenerativeAI(
+) -> Any:
+    """Prefer Gemini, with local Ollama llama3.2 as a transparent fallback."""
+    ollama = ChatOllama(model=os.getenv("OLLAMA_MODEL", "llama3.2"), temperature=temperature)
+    if not os.getenv("GOOGLE_API_KEY"):
+        return ollama
+    gemini = ChatGoogleGenerativeAI(
         model=model,
         google_api_key=os.getenv("GOOGLE_API_KEY"),
         temperature=temperature,
         convert_system_message_to_human=True,
     )
+    # Network/quota failures from Gemini then continue with a locally running
+    # Ollama model.  The same chain API is preserved for the UI.
+    return gemini.with_fallbacks([ollama])
 
 
 # ── Conversational RAG chain ────────────────────────────────────────────────
@@ -229,6 +243,135 @@ def build_rag_chain(
     return chain
 
 
+@dataclass
+class ToolResult:
+    """A result returned by one of the RAG agent's explicit tools."""
+    name: str
+    documents: list[Document]
+    detail: str | None = None
+
+
+class LLMGeneratedSQLTool:
+    """Generate and safely execute a read-only SQLite query for the RAG agent."""
+    name = "llm_sql_database"
+    employee_columns = {
+        "id", "first_name", "last_name", "sex", "department", "role", "salary",
+        "years_of_expertise", "sick_leave_days", "paid_time_off_days",
+        "mental_health_leave_days", "maternity_leave_days", "paternity_leave_days",
+        "absent_days_jan", "absent_days_feb", "absent_days_mar", "absent_days_apr",
+        "absent_days_may", "absent_days_jun", "absent_days_jul", "absent_days_aug",
+        "absent_days_sep", "absent_days_oct", "absent_days_nov", "absent_days_dec",
+    }
+    knowledge_columns = {"key", "title", "content"}
+
+    def __init__(self, llm: Any):
+        self.llm = llm
+
+    def generate_sql(self, question: str) -> str:
+        prompt = f"""Generate exactly one SQLite SELECT query for this employee-portal question.
+Return SQL only: no Markdown, explanation, comments, or semicolon.
+
+Allowed tables and columns:
+- employees: {', '.join(sorted(self.employee_columns))}
+- rag_knowledge: key, title, content
+
+Rules:
+- Use only one table, never JOIN, UNION, subqueries, or SELECT *.
+- For every employees query, use exactly `WHERE id = :employee_id`.
+- Never query password_hash or any table not listed.
+- For rag_knowledge searches, use LIKE with the user-facing terms and LIMIT 3.
+- Do not write data or use PRAGMA.
+
+Question: {question}"""
+        response = self.llm.invoke(prompt)
+        content = getattr(response, "content", response)
+        if isinstance(content, list):
+            content = "".join(str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in content)
+        sql = str(content).strip()
+        sql = re.sub(r"^```(?:sql)?\s*|\s*```$", "", sql, flags=re.IGNORECASE).strip()
+        return sql.rstrip(";").strip()
+
+    def validate_sql(self, sql: str) -> None:
+        normalized = " ".join(sql.lower().split())
+        forbidden = (";", "--", "/*", "*/", "insert", "update", "delete", "drop", "alter", "create", "attach", "pragma", "union", "join", "password_hash")
+        if not normalized.startswith("select ") or any(token in normalized for token in forbidden):
+            raise ValueError("Only a single read-only SELECT query is allowed.")
+        tables = re.findall(r"\bfrom\s+([a-z_][a-z0-9_]*)", normalized)
+        if len(tables) != 1 or tables[0] not in {"employees", "rag_knowledge"}:
+            raise ValueError("The query must use exactly one approved table.")
+        selected = normalized.split(" from ", 1)[0].removeprefix("select ")
+        columns = {part.strip().split(".")[-1] for part in selected.split(",")}
+        allowed = self.employee_columns if tables[0] == "employees" else self.knowledge_columns
+        if not columns or "*" in columns or not columns.issubset(allowed):
+            raise ValueError("The query requested a disallowed column.")
+        if tables[0] == "employees" and not re.fullmatch(
+            r"select [a-z_,. ]+ from employees where id = :employee_id(?: limit [0-9]+)?",
+            normalized,
+        ):
+            raise ValueError("Employee queries must be scoped to the logged-in employee.")
+
+    def run(self, question: str, employee_id: str | None) -> ToolResult:
+        try:
+            sql = self.generate_sql(question)
+            self.validate_sql(sql)
+            if not os.path.exists(DB_PATH):
+                return ToolResult(self.name, [], "Database not available")
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(sql, {"employee_id": employee_id}).fetchall()
+            finally:
+                conn.close()
+            payload = [dict(row) for row in rows]
+            document = Document(
+                page_content=f"SQL query result: {json.dumps(payload, default=str)}",
+                metadata={"source": "database:LLM-generated SQL", "sql": sql},
+            )
+            return ToolResult(self.name, [document] if payload else [], sql)
+        except Exception as exc:
+            # The agent can still answer from policy documents when the model
+            # produces unsuitable SQL or the database is unavailable.
+            return ToolResult(self.name, [], f"SQL not run: {exc}")
+
+
+class RAGAgent:
+    """Agent facade that calls retrieval and SQLite tools before generating."""
+
+    def __init__(self, chain: ConversationalRetrievalChain, retriever: Any, employee_id: str | None,
+                 sql_llm: Any):
+        self.chain = chain
+        self.retriever = retriever
+        self.employee_id = employee_id
+        self.database_tool = LLMGeneratedSQLTool(sql_llm)
+
+    def invoke(self, question: str) -> dict:
+        # Invoke all tools deterministically: this is auditable and ensures the
+        # assistant always has current database information available.
+        retrieved = self.retriever.invoke(question)
+        db_result = self.database_tool.run(question, self.employee_id)
+        context_docs = list(retrieved) + db_result.documents
+        # ConversationalRetrievalChain owns memory; provide a temporary
+        # retriever result through its normal call, then append database facts
+        # directly to the question so the selected LLM sees them.
+        db_context = "\n".join(doc.page_content for doc in context_docs if doc.metadata.get("source", "").startswith("database:"))
+        augmented_question = question if not db_context else f"{question}\n\nDatabase tool results:\n{db_context}"
+        result = self.chain.invoke({"question": augmented_question})
+        source_documents = list(result.get("source_documents", [])) + db_result.documents
+        return {
+            "answer": result.get("answer", ""),
+            "source_documents": source_documents,
+            "tools_used": ["hybrid_retriever", db_result.name],
+            "sql": db_result.detail,
+        }
+
+
+def build_rag_agent(retriever: EnsembleRetriever, employee_info: Optional[dict] = None,
+                    model: str = "models/gemini-2.5-flash") -> RAGAgent:
+    """Build the conversational chain and expose it as a tool-using RAG agent."""
+    chain = build_rag_chain(retriever, employee_info, model)
+    return RAGAgent(chain, retriever, (employee_info or {}).get("id"), get_llm(model, temperature=0))
+
+
 def _build_qa_prompt(preamble: str):
     """Build the QA prompt template with the system preamble."""
     from langchain_core.prompts import PromptTemplate
@@ -253,13 +396,13 @@ def _build_qa_prompt(preamble: str):
 # ── Convenience wrapper ─────────────────────────────────────────────────────
 
 def query_rag(
-    chain: ConversationalRetrievalChain,
+    chain: Any,
     question: str,
 ) -> dict:
     """
     Ask a question and return ``{"answer": str, "sources": list[str]}``.
     """
-    result = chain.invoke({"question": question})
+    result = chain.invoke(question) if isinstance(chain, RAGAgent) else chain.invoke({"question": question})
     sources = list({
         doc.metadata.get("source", "unknown")
         for doc in result.get("source_documents", [])
@@ -267,4 +410,6 @@ def query_rag(
     return {
         "answer": result.get("answer", ""),
         "sources": sorted(sources),
+        "tools_used": result.get("tools_used", []),
+        "sql": result.get("sql"),
     }

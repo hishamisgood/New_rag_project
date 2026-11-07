@@ -6,7 +6,8 @@ A Retrieval-Augmented Generation (RAG) application for company employees, built 
 
 - 🔐 **Secure Authentication** — SQLite-backed login with bcrypt-hashed passwords
 - 👤 **Employee Dashboard** — Personal profile with salary, leave stats, and monthly absence charts
-- 🤖 **RAG Chat Interface** — Ask questions about company policies, benefits, and your own profile
+- 🤖 **Tool-Using RAG Agent** — Combines policy retrieval with read-only SQLite tools for current employee and company-help information
+- 🧠 **Resilient LLMs** — Gemini is preferred, with local Ollama `llama3.2` as the automatic fallback
 - 🔍 **Hybrid Search** — Combines semantic search (ChromaDB) with keyword search (BM25) for best retrieval
 - 📄 **Rich Documents** — PDFs with charts, tables, and complex layouts
 
@@ -128,6 +129,21 @@ NEW_RAG_Project/
    - BM25 keyword search (50% weight)
 6. **LLM**: Gemini generates answers from retrieved context + employee profile
 7. **Memory**: ConversationBufferWindowMemory (last 10 exchanges)
+
+### Database knowledge and evaluation
+
+On startup, the app seeds a `rag_knowledge` SQLite table with operational
+information about IT support, payroll, expense reimbursement, and learning.
+The agent calls this tool alongside hybrid document retrieval and displays the
+sources/tools it used in the chat UI. Evaluate those database-backed questions
+without an LLM or vector store with:
+
+```bash
+python evaluate_rag.py --dry-run
+```
+
+For end-to-end evaluation, build ChromaDB and ensure Gemini or Ollama is
+available, then run `python evaluate_rag.py`.
 
 ### Employee Context
 When a user logs in, their full profile (salary, department, leave days, etc.)

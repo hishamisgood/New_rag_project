@@ -24,11 +24,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-from auth import authenticate, get_employee
+from auth import authenticate, get_employee, ensure_knowledge_base
 from rag_engine import (
     load_vectorstore,
     create_hybrid_retriever,
-    build_rag_chain,
+    build_rag_agent,
     query_rag,
 )
 
@@ -218,10 +218,10 @@ def init_rag():
 
 
 def get_rag_chain():
-    """Get or create the RAG chain for the current session."""
+    """Get or create the tool-using RAG agent for the current session."""
     if st.session_state.rag_chain is None:
         retriever = init_rag()
-        st.session_state.rag_chain = build_rag_chain(
+        st.session_state.rag_chain = build_rag_agent(
             retriever=retriever,
             employee_info=st.session_state.employee,
         )
@@ -241,8 +241,11 @@ def show_chat():
     )
     st.markdown(
         "Ask me about **company policies**, **your profile**, "
-        "**benefits**, **leave policies**, or anything from our knowledge base."
+        "**benefits**, **leave policies**, or anything from our knowledge base. "
+        "I can also look up current company help, payroll, expenses, and training information."
     )
+    with st.expander("How the assistant answers", expanded=False):
+        st.caption("The RAG agent uses hybrid document search plus read-only SQLite tools for curated company information and your current profile. Gemini is preferred; Ollama llama3.2 is used automatically if Gemini is unavailable.")
     st.markdown("---")
 
     # Display chat history
@@ -258,6 +261,11 @@ def show_chat():
                     f"<div style='margin-top:8px;'>{sources_html}</div>",
                     unsafe_allow_html=True,
                 )
+            if msg.get("tools_used"):
+                st.caption("Tools used: " + ", ".join(msg["tools_used"]))
+            if msg.get("sql"):
+                with st.expander("LLM-generated SQL", expanded=False):
+                    st.code(msg["sql"], language="sql")
 
     # Chat input
     if prompt := st.chat_input("Ask a question..."):
@@ -276,6 +284,8 @@ def show_chat():
                     result = query_rag(chain, prompt)
                     answer = result["answer"]
                     sources = result["sources"]
+                    tools_used = result.get("tools_used", [])
+                    sql = result.get("sql")
                 except Exception as e:
                     answer = (
                         f"⚠️ I encountered an error: {str(e)}\n\n"
@@ -284,6 +294,8 @@ def show_chat():
                         "(`python build_vectorstore.py`)."
                     )
                     sources = []
+                    tools_used = []
+                    sql = None
 
             st.markdown(answer)
             if sources:
@@ -295,12 +307,19 @@ def show_chat():
                     f"<div style='margin-top:8px;'>{sources_html}</div>",
                     unsafe_allow_html=True,
                 )
+            if tools_used:
+                st.caption("Tools used: " + ", ".join(tools_used))
+            if sql:
+                with st.expander("LLM-generated SQL", expanded=False):
+                    st.code(sql, language="sql")
 
         # Save assistant message
         st.session_state.chat_history.append({
             "role": "assistant",
             "content": answer,
             "sources": sources,
+            "tools_used": tools_used,
+            "sql": sql,
         })
 
     # Suggested questions
@@ -315,6 +334,8 @@ def show_chat():
             "Am I eligible for maternity/paternity leave?",
             "What is the company's performance review process?",
             "How do I request time off?",
+            "How do I submit an expense reimbursement?",
+            "When is payroll processed?",
         ]
         cols = st.columns(2)
         for i, suggestion in enumerate(suggestions):
@@ -345,10 +366,12 @@ def main():
         )
         return
 
+    ensure_knowledge_base()
+
     if not os.getenv("GOOGLE_API_KEY"):
         st.warning(
             "⚠️ `GOOGLE_API_KEY` not found. Copy `.env.example` to `.env` "
-            "and add your API key. The chat feature requires it."
+            "and add your API key. The app will use local Ollama llama3.2 if it is running."
         )
 
     if not st.session_state.authenticated:

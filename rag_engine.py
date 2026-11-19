@@ -98,17 +98,24 @@ def load_and_split_documents(docs_dir: str = DOCS_DIR) -> list[Document]:
 # ── Build / load the vector store ────────────────────────────────────────────
 
 def build_vectorstore(chunks: list[Document]) -> Chroma:
-    """Create (or overwrite) the ChromaDB vector store on disk."""
+    """Create (or overwrite) the ChromaDB vector store on disk.
+
+    FIX D: Chroma.from_documents() appends to an existing collection, so
+    running this script twice doubled all vectors. We now explicitly clear
+    the collection before ingesting so re-runs are idempotent.
+    """
     embeddings = get_embeddings()
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
+    # Open (or create) the existing store and wipe it before re-ingesting.
+    existing = Chroma(
         collection_name=COLLECTION_NAME,
         persist_directory=CHROMA_DIR,
+        embedding_function=embeddings,
     )
+    existing.reset_collection()
+    existing.add_documents(chunks)
     print(f"  💾 ChromaDB persisted → {CHROMA_DIR}/ "
-          f"({vectorstore._collection.count()} vectors)")
-    return vectorstore
+          f"({existing._collection.count()} vectors)")
+    return existing
 
 
 def load_vectorstore() -> Chroma:
@@ -293,9 +300,18 @@ Question: {question}"""
 
     def validate_sql(self, sql: str) -> None:
         normalized = " ".join(sql.lower().split())
-        forbidden = (";", "--", "/*", "*/", "insert", "update", "delete", "drop", "alter", "create", "attach", "pragma", "union", "join", "password_hash")
-        if not normalized.startswith("select ") or any(token in normalized for token in forbidden):
+        # FIX (Security): Use word-boundary regex instead of substring `in`
+        # so that a legitimate query like "WHERE content LIKE '%updated%'" is
+        # not falsely blocked because "update" appears inside "updated".
+        write_ops = re.compile(
+            r"\b(insert|update|delete|drop|alter|create|attach|pragma|union|join)\b"
+        )
+        if not normalized.startswith("select ") or write_ops.search(normalized):
             raise ValueError("Only a single read-only SELECT query is allowed.")
+        if ";" in normalized or "--" in normalized or "/*" in normalized or "*/" in normalized:
+            raise ValueError("Query contains forbidden punctuation.")
+        if "password_hash" in normalized:
+            raise ValueError("Access to password_hash is forbidden.")
         tables = re.findall(r"\bfrom\s+([a-z_][a-z0-9_]*)", normalized)
         if len(tables) != 1 or tables[0] not in {"employees", "rag_knowledge"}:
             raise ValueError("The query must use exactly one approved table.")
@@ -323,11 +339,22 @@ Question: {question}"""
             finally:
                 conn.close()
             payload = [dict(row) for row in rows]
-            document = Document(
-                page_content=f"SQL query result: {json.dumps(payload, default=str)}",
-                metadata={"source": "database:LLM-generated SQL", "sql": sql},
-            )
-            return ToolResult(self.name, [document] if payload else [], sql)
+
+            # FIX E: When querying rag_knowledge, use "database:{title}" as the
+            # source so live evaluation matches the same contract as --dry-run.
+            # For employee queries (no "title" column), fall back to the SQL tag.
+            documents = []
+            for row_dict in payload:
+                if "title" in row_dict:
+                    source = f"database:{row_dict['title']}"
+                else:
+                    source = "database:LLM-generated SQL"
+                documents.append(Document(
+                    page_content=f"SQL query result: {json.dumps(row_dict, default=str)}",
+                    metadata={"source": source, "sql": sql},
+                ))
+
+            return ToolResult(self.name, documents if payload else [], sql)
         except Exception as exc:
             # The agent can still answer from policy documents when the model
             # produces unsuitable SQL or the database is unavailable.
@@ -345,16 +372,24 @@ class RAGAgent:
         self.database_tool = LLMGeneratedSQLTool(sql_llm)
 
     def invoke(self, question: str) -> dict:
-        # Invoke all tools deterministically: this is auditable and ensures the
-        # assistant always has current database information available.
-        retrieved = self.retriever.invoke(question)
+        # FIX C: Previously self.retriever.invoke(question) was called here but
+        # its results were discarded (only db_context was used), causing:
+        #   • 2× retrieval cost (Gemini embedding API called twice per turn)
+        #   • Degraded semantic search (augmented_question with raw JSON was embedded)
+        #   • Bloated memory (SQL payload was stored in ConversationBufferWindowMemory)
+        # Now the ConversationalRetrievalChain handles its own retrieval internally.
+        # Database facts are appended only to the question string seen by the LLM,
+        # keeping the stored memory key clean.
         db_result = self.database_tool.run(question, self.employee_id)
-        context_docs = list(retrieved) + db_result.documents
-        # ConversationalRetrievalChain owns memory; provide a temporary
-        # retriever result through its normal call, then append database facts
-        # directly to the question so the selected LLM sees them.
-        db_context = "\n".join(doc.page_content for doc in context_docs if doc.metadata.get("source", "").startswith("database:"))
-        augmented_question = question if not db_context else f"{question}\n\nDatabase tool results:\n{db_context}"
+        db_context = "\n".join(
+            doc.page_content
+            for doc in db_result.documents
+            if doc.metadata.get("source", "").startswith("database:")
+        )
+        augmented_question = (
+            question if not db_context
+            else f"{question}\n\nDatabase tool results:\n{db_context}"
+        )
         result = self.chain.invoke({"question": augmented_question})
         source_documents = list(result.get("source_documents", [])) + db_result.documents
         return {

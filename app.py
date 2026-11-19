@@ -10,6 +10,7 @@ Features
 Run with:  streamlit run app.py
 """
 
+import html
 import os
 import streamlit as st
 from dotenv import load_dotenv
@@ -74,15 +75,22 @@ st.markdown("""
 
 
 # ── Session state defaults ───────────────────────────────────────────────────
-DEFAULTS = {
-    "authenticated": False,
-    "employee": None,
-    "chat_history": [],
-    "rag_chain": None,
-}
-for key, val in DEFAULTS.items():
-    if key not in st.session_state:
-        st.session_state[key] = val
+# FIX A: Use a helper function instead of a module-level mutable dict so every
+# session (and every sign-out) always receives its own independent list /
+# object — no two users can mutate the same in-memory reference.
+def init_session_state(reset: bool = False) -> None:
+    defaults = {
+        "authenticated": False,
+        "employee": None,
+        "chat_history": [],   # fresh list on every call
+        "rag_chain": None,
+        "pending_prompt": None,  # FIX B: staging area for suggestion clicks
+    }
+    for key, val in defaults.items():
+        if reset or key not in st.session_state:
+            st.session_state[key] = val
+
+init_session_state()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -127,7 +135,11 @@ def show_login():
                     if employee:
                         st.session_state.authenticated = True
                         st.session_state.employee = employee
-                        st.session_state.chat_history = []
+                        # FIX A: use the helper so we get a fresh list,
+                        # not the same reference shared across sessions.
+                        init_session_state(reset=True)
+                        st.session_state.authenticated = True
+                        st.session_state.employee = employee
                         st.success(
                             f"Welcome, {employee['first_name']}! Redirecting..."
                         )
@@ -199,15 +211,22 @@ def show_sidebar_profile():
         st.bar_chart(absence_data, height=150)
 
         st.markdown("---")
+        # FIX A: use the helper with reset=True to wipe every key with a fresh
+        # value — this guarantees the next user session starts completely clean.
         if st.button("🚪 Sign Out", use_container_width=True):
-            for key in DEFAULTS:
-                st.session_state[key] = DEFAULTS[key]
+            init_session_state(reset=True)
             st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # RAG INITIALISATION
 # ═══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_resource(show_spinner="Seeding knowledge base...")
+def _ensure_knowledge_base_cached():
+    """FIX: Run once per server process, not on every Streamlit rerun."""
+    ensure_knowledge_base()
+
 
 @st.cache_resource(show_spinner="Loading knowledge base...")
 def init_rag():
@@ -253,8 +272,9 @@ def show_chat():
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if msg.get("sources"):
+                # FIX: escape source names before injecting into HTML
                 sources_html = " ".join(
-                    f'<span class="source-badge">📄 {s}</span>'
+                    f'<span class="source-badge">📄 {html.escape(s)}</span>'
                     for s in msg["sources"]
                 )
                 st.markdown(
@@ -267,8 +287,10 @@ def show_chat():
                 with st.expander("LLM-generated SQL", expanded=False):
                     st.code(msg["sql"], language="sql")
 
-    # Chat input
-    if prompt := st.chat_input("Ask a question..."):
+    # FIX B: Read from chat_input OR from pending_prompt set by a suggestion
+    # button. Using `pop` clears it atomically so it only fires once.
+    prompt = st.chat_input("Ask a question...") or st.session_state.pop("pending_prompt", None)
+    if prompt:
         # Display user message
         st.session_state.chat_history.append({
             "role": "user", "content": prompt
@@ -299,8 +321,9 @@ def show_chat():
 
             st.markdown(answer)
             if sources:
+                # FIX: escape source names before injecting into HTML
                 sources_html = " ".join(
-                    f'<span class="source-badge">📄 {s}</span>'
+                    f'<span class="source-badge">📄 {html.escape(s)}</span>'
                     for s in sources
                 )
                 st.markdown(
@@ -342,9 +365,9 @@ def show_chat():
             with cols[i % 2]:
                 if st.button(f"💬 {suggestion}", key=f"sug_{i}",
                             use_container_width=True):
-                    st.session_state.chat_history.append({
-                        "role": "user", "content": suggestion
-                    })
+                    # FIX B: Store in pending_prompt so the chat handler
+                    # above picks it up after rerun instead of going unanswered.
+                    st.session_state.pending_prompt = suggestion
                     st.rerun()
 
 
@@ -366,7 +389,8 @@ def main():
         )
         return
 
-    ensure_knowledge_base()
+    # FIX: Run once per server process via cache_resource instead of on every rerun.
+    _ensure_knowledge_base_cached()
 
     if not os.getenv("GOOGLE_API_KEY"):
         st.warning(

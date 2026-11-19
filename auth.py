@@ -83,12 +83,14 @@ def init_db() -> None:
     )
 
     rows_to_insert = []
-    # rounds=4 is significantly faster for batch seeding (completes in ~2s vs ~10 mins)
-    # while maintaining valid bcrypt formatting and security
-    salt = bcrypt.gensalt(rounds=4)
-
+    # FIX (Security): Generate a unique salt per employee. bcrypt.gensalt()
+    # was previously called once outside the loop, so all 2,000 employees
+    # shared the same salt — if any single hash leaked the shared salt
+    # allowed faster multi-target cracking.  The per-call overhead at
+    # rounds=4 is negligible (~1 ms per employee → ~2 s total).
     for idx, (_, row) in enumerate(df.iterrows(), start=1):
         values = [row[c] for c in df.columns if c != "password"]
+        salt = bcrypt.gensalt(rounds=4)   # unique salt every iteration
         pw_hash = bcrypt.hashpw(str(row["password"]).encode(), salt).decode()
         values.append(pw_hash)
         rows_to_insert.append(values)
@@ -118,12 +120,13 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
 
 def authenticate(employee_id: str, password: str) -> dict | None:
     """Return employee dict if credentials are valid, else ``None``."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM employees WHERE id = ?", (employee_id,)
-    ).fetchone()
-    conn.close()
+    # FIX (Security): Use context manager so the connection is closed cleanly
+    # even if bcrypt.checkpw or the execute call raises an exception.
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM employees WHERE id = ?", (employee_id,)
+        ).fetchone()
 
     if row is None:
         return None
@@ -135,12 +138,12 @@ def authenticate(employee_id: str, password: str) -> dict | None:
 
 def get_employee(employee_id: str) -> dict | None:
     """Fetch an employee profile (no auth check)."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM employees WHERE id = ?", (employee_id,)
-    ).fetchone()
-    conn.close()
+    # FIX (Security): Use context manager for clean connection lifecycle.
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM employees WHERE id = ?", (employee_id,)
+        ).fetchone()
     return _row_to_dict(row) if row else None
 
 

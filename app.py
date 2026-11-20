@@ -25,29 +25,18 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-from auth import authenticate, get_employee, ensure_knowledge_base
-from rag_engine import (
+from src.auth import authenticate
+from src.config import DB_PATH
+from src.database import ensure_knowledge_base, ensure_transactional_tables
+from src.agent import build_rag_agent, query_rag
+from src.retriever import (
     load_vectorstore,
     create_hybrid_retriever,
-    build_rag_agent,
-    query_rag,
 )
 
 # ── Custom CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    /* Login card */
-    .login-container {
-        max-width: 420px;
-        margin: 0 auto;
-        padding: 2.5rem 2rem;
-        border-radius: 16px;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        box-shadow: 0 10px 40px rgba(0,0,0,0.15);
-    }
-    .login-container h1 { color: white; text-align: center; }
-    .login-container p  { color: #e0e0e0; text-align: center; }
-
     /* Chat message styling */
     .source-badge {
         display: inline-block;
@@ -75,16 +64,13 @@ st.markdown("""
 
 
 # ── Session state defaults ───────────────────────────────────────────────────
-# FIX A: Use a helper function instead of a module-level mutable dict so every
-# session (and every sign-out) always receives its own independent list /
-# object — no two users can mutate the same in-memory reference.
 def init_session_state(reset: bool = False) -> None:
     defaults = {
         "authenticated": False,
         "employee": None,
-        "chat_history": [],   # fresh list on every call
+        "chat_history": [],
         "rag_chain": None,
-        "pending_prompt": None,  # FIX B: staging area for suggestion clicks
+        "pending_prompt": None,
     }
     for key, val in defaults.items():
         if reset or key not in st.session_state:
@@ -133,10 +119,6 @@ def show_login():
                         employee = authenticate(emp_id, password)
 
                     if employee:
-                        st.session_state.authenticated = True
-                        st.session_state.employee = employee
-                        # FIX A: use the helper so we get a fresh list,
-                        # not the same reference shared across sessions.
                         init_session_state(reset=True)
                         st.session_state.authenticated = True
                         st.session_state.employee = employee
@@ -168,12 +150,16 @@ def show_sidebar_profile():
         return
 
     with st.sidebar:
+        fn = html.escape(str(emp['first_name']))
+        ln = html.escape(str(emp['last_name']))
+        role = html.escape(str(emp['role']))
+        dept = html.escape(str(emp['department']))
         st.markdown(f"""
         <div class="profile-card">
-            <h3>👤 {emp['first_name']} {emp['last_name']}</h3>
+            <h3>👤 {fn} {ln}</h3>
             <p style="color:#616161; margin:0;">
-                {emp['role']}<br/>
-                <b>{emp['department']}</b>
+                {role}<br/>
+                <b>{dept}</b>
             </p>
         </div>
         """, unsafe_allow_html=True)
@@ -183,6 +169,11 @@ def show_sidebar_profile():
         st.markdown(f"**Sex:** {emp['sex']}")
         st.markdown(f"**Salary:** ${emp['salary']:,.2f}")
         st.markdown(f"**Experience:** {int(emp['years_of_expertise'])} years")
+        st.markdown(f"**Hire Date:** {emp.get('hire_date', 'N/A')}")
+        st.markdown(f"**Work Mode:** {emp.get('work_mode', 'N/A')}")
+        st.markdown(f"**Office Location:** {emp.get('office_location', 'N/A')}")
+        st.markdown(f"**Health Plan:** {emp.get('health_plan', 'N/A')}")
+        st.markdown(f"**Performance Rating:** {emp.get('performance_rating', 'N/A')}/5")
 
         st.markdown("---")
         st.markdown("##### 📊 Leave Summary")
@@ -211,8 +202,6 @@ def show_sidebar_profile():
         st.bar_chart(absence_data, height=150)
 
         st.markdown("---")
-        # FIX A: use the helper with reset=True to wipe every key with a fresh
-        # value — this guarantees the next user session starts completely clean.
         if st.button("🚪 Sign Out", use_container_width=True):
             init_session_state(reset=True)
             st.rerun()
@@ -224,8 +213,9 @@ def show_sidebar_profile():
 
 @st.cache_resource(show_spinner="Seeding knowledge base...")
 def _ensure_knowledge_base_cached():
-    """FIX: Run once per server process, not on every Streamlit rerun."""
+    """Seed knowledge tables once per server process."""
     ensure_knowledge_base()
+    ensure_transactional_tables()
 
 
 @st.cache_resource(show_spinner="Loading knowledge base...")
@@ -247,6 +237,23 @@ def get_rag_chain():
     return st.session_state.rag_chain
 
 
+def _render_message_metadata(sources, tools_used, sql):
+    if sources:
+        sources_html = " ".join(
+            f'<span class="source-badge">📄 {html.escape(source)}</span>'
+            for source in sources
+        )
+        st.markdown(
+            f"<div style='margin-top:8px;'>{sources_html}</div>",
+            unsafe_allow_html=True,
+        )
+    if tools_used:
+        st.caption("Tools used: " + ", ".join(tools_used))
+    if sql:
+        with st.expander("LLM-generated SQL", expanded=False):
+            st.code(sql, language="sql")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CHAT INTERFACE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -260,35 +267,23 @@ def show_chat():
     )
     st.markdown(
         "Ask me about **company policies**, **your profile**, "
-        "**benefits**, **leave policies**, or anything from our knowledge base. "
-        "I can also look up current company help, payroll, expenses, and training information."
+        "**benefits**, **leave**, and the company guide. I can also look up your "
+        "expense claims, leave requests, pay history, and training costs, then "
+        "combine those records with relevant policy documents."
     )
     with st.expander("How the assistant answers", expanded=False):
-        st.caption("The RAG agent uses hybrid document search plus read-only SQLite tools for curated company information and your current profile. Gemini is preferred; Ollama llama3.2 is used automatically if Gemini is unavailable.")
+        st.caption("The assistant routes each question dynamically to hybrid policy search or read-only, employee-scoped SQLite queries. Gemini is preferred; Ollama llama3.2 is used automatically if Gemini is unavailable.")
     st.markdown("---")
 
     # Display chat history
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            if msg.get("sources"):
-                # FIX: escape source names before injecting into HTML
-                sources_html = " ".join(
-                    f'<span class="source-badge">📄 {html.escape(s)}</span>'
-                    for s in msg["sources"]
-                )
-                st.markdown(
-                    f"<div style='margin-top:8px;'>{sources_html}</div>",
-                    unsafe_allow_html=True,
-                )
-            if msg.get("tools_used"):
-                st.caption("Tools used: " + ", ".join(msg["tools_used"]))
-            if msg.get("sql"):
-                with st.expander("LLM-generated SQL", expanded=False):
-                    st.code(msg["sql"], language="sql")
+            _render_message_metadata(
+                msg.get("sources", []), msg.get("tools_used", []), msg.get("sql")
+            )
 
-    # FIX B: Read from chat_input OR from pending_prompt set by a suggestion
-    # button. Using `pop` clears it atomically so it only fires once.
+    # Pop a staged suggestion so it is handled only once after rerun.
     prompt = st.chat_input("Ask a question...") or st.session_state.pop("pending_prompt", None)
     if prompt:
         # Display user message
@@ -313,28 +308,14 @@ def show_chat():
                         f"⚠️ I encountered an error: {str(e)}\n\n"
                         "Please make sure your `GOOGLE_API_KEY` is set in the "
                         "`.env` file and that the vector store has been built "
-                        "(`python build_vectorstore.py`)."
+                        "(`python scripts/build_vectorstore.py`)."
                     )
                     sources = []
                     tools_used = []
                     sql = None
 
             st.markdown(answer)
-            if sources:
-                # FIX: escape source names before injecting into HTML
-                sources_html = " ".join(
-                    f'<span class="source-badge">📄 {html.escape(s)}</span>'
-                    for s in sources
-                )
-                st.markdown(
-                    f"<div style='margin-top:8px;'>{sources_html}</div>",
-                    unsafe_allow_html=True,
-                )
-            if tools_used:
-                st.caption("Tools used: " + ", ".join(tools_used))
-            if sql:
-                with st.expander("LLM-generated SQL", expanded=False):
-                    st.code(sql, language="sql")
+            _render_message_metadata(sources, tools_used, sql)
 
         # Save assistant message
         st.session_state.chat_history.append({
@@ -357,16 +338,19 @@ def show_chat():
             "Am I eligible for maternity/paternity leave?",
             "What is the company's performance review process?",
             "How do I request time off?",
-            "How do I submit an expense reimbursement?",
-            "When is payroll processed?",
+            "How much have I been reimbursed for travel this year?",
+            "Which of my expense claims are still pending approval?",
+            "What was my net pay in September and did I receive a bonus in 2026?",
+            "How much of my $3,000 annual Learning & Development budget do I have left?",
+            "What is the status of my recent leave requests?",
+            "How much have I claimed for Books, and how much of the $300 book allowance remains?",
         ]
         cols = st.columns(2)
         for i, suggestion in enumerate(suggestions):
             with cols[i % 2]:
                 if st.button(f"💬 {suggestion}", key=f"sug_{i}",
                             use_container_width=True):
-                    # FIX B: Store in pending_prompt so the chat handler
-                    # above picks it up after rerun instead of going unanswered.
+                    # Process the selected suggestion on the next rerun.
                     st.session_state.pending_prompt = suggestion
                     st.rerun()
 
@@ -377,19 +361,18 @@ def show_chat():
 
 def main():
     # Check prerequisites
-    if not os.path.exists("data/employees.db"):
+    if not os.path.exists(DB_PATH):
         st.error(
             "⚠️ Database not found! Run these commands first:\n"
             "```\n"
-            "python generate_employees.py\n"
-            "python auth.py\n"
-            "python generate_documents.py\n"
-            "python build_vectorstore.py\n"
+            "python scripts/generate_employees.py\n"
+            "python scripts/init_db.py\n"
+            "python scripts/generate_documents.py\n"
+            "python scripts/build_vectorstore.py\n"
             "```"
         )
         return
 
-    # FIX: Run once per server process via cache_resource instead of on every rerun.
     _ensure_knowledge_base_cached()
 
     if not os.getenv("GOOGLE_API_KEY"):

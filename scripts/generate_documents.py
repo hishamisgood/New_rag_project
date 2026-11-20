@@ -16,7 +16,9 @@ Documents
 
 import io
 import os
+import sys
 import textwrap
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend
@@ -24,17 +26,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch, mm
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+from reportlab.lib.units import inch
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
     Image as RLImage, PageBreak, HRFlowable,
 )
 
-DOCS_DIR = os.path.join("data", "documents")
-DATA_DIR = "data"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.config import DOCS_DIR, EXCEL_PATH
+
 STYLES = getSampleStyleSheet()
 
 # ── Custom paragraph styles ──────────────────────────────────────────────────
@@ -72,9 +78,8 @@ STD_TABLE_STYLE = TableStyle([
 
 
 def _load_employees() -> pd.DataFrame | None:
-    path = os.path.join(DATA_DIR, "employees.xlsx")
-    if os.path.exists(path):
-        return pd.read_excel(path, engine="openpyxl")
+    if os.path.exists(EXCEL_PATH):
+        return pd.read_excel(EXCEL_PATH, engine="openpyxl")
     return None
 
 
@@ -101,15 +106,25 @@ def _title_page(story, title, subtitle="NovaCorp Industries", date="October 2026
     story.append(PageBreak())
 
 
+def _new_doc(filename: str) -> tuple[str, SimpleDocTemplate]:
+    path = os.path.join(DOCS_DIR, filename)
+    doc = SimpleDocTemplate(
+        path,
+        pagesize=letter,
+        leftMargin=0.75 * inch,
+        rightMargin=0.75 * inch,
+        topMargin=0.75 * inch,
+        bottomMargin=0.75 * inch,
+    )
+    return path, doc
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1. EMPLOYEE HANDBOOK
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def generate_employee_handbook(df: pd.DataFrame | None):
-    path = os.path.join(DOCS_DIR, "employee_handbook.pdf")
-    doc = SimpleDocTemplate(path, pagesize=letter,
-                            leftMargin=0.75*inch, rightMargin=0.75*inch,
-                            topMargin=0.75*inch, bottomMargin=0.75*inch)
+    path, doc = _new_doc("employee_handbook.pdf")
     story = []
     _title_page(story, "Employee Handbook")
 
@@ -259,11 +274,8 @@ def generate_employee_handbook(df: pd.DataFrame | None):
 # 2. ONBOARDING POLICY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def generate_onboarding_policy(df: pd.DataFrame | None):
-    path = os.path.join(DOCS_DIR, "onboarding_policy.pdf")
-    doc = SimpleDocTemplate(path, pagesize=letter,
-                            leftMargin=0.75*inch, rightMargin=0.75*inch,
-                            topMargin=0.75*inch, bottomMargin=0.75*inch)
+def generate_onboarding_policy():
+    path, doc = _new_doc("onboarding_policy.pdf")
     story = []
     _title_page(story, "Onboarding Policy &\nNew Hire Guide")
 
@@ -387,11 +399,8 @@ def generate_onboarding_policy(df: pd.DataFrame | None):
 # 3. RETURN-TO-OFFICE POLICY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def generate_rto_policy(df: pd.DataFrame | None):
-    path = os.path.join(DOCS_DIR, "return_to_office_policy.pdf")
-    doc = SimpleDocTemplate(path, pagesize=letter,
-                            leftMargin=0.75*inch, rightMargin=0.75*inch,
-                            topMargin=0.75*inch, bottomMargin=0.75*inch)
+def generate_rto_policy():
+    path, doc = _new_doc("return_to_office_policy.pdf")
     story = []
     _title_page(story, "Return-to-Office\n& Hybrid Work Policy")
 
@@ -439,7 +448,7 @@ def generate_rto_policy(df: pd.DataFrame | None):
     story.append(t)
     story.append(Spacer(1, 0.3*inch))
 
-    # Office capacity chart (image-based → OCR needed)
+    # Office capacity chart (image-based)
     fig, ax = plt.subplots(figsize=(8, 4))
     months_labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -448,12 +457,23 @@ def generate_rto_policy(df: pd.DataFrame | None):
     ax.bar(months_labels, capacity, color="#ff8f00", alpha=0.8, label="Actual Utilisation %")
     ax.plot(months_labels, target, "r--", linewidth=2, label="Target (75%)")
     ax.set_ylabel("Office Utilisation (%)")
-    ax.set_title("Monthly Office Utilisation Rate – 2025", fontsize=13, fontweight="bold")
+    ax.set_title("Monthly Office Utilisation Rate – 2025", fontsize=13, fontweight="bold", pad=12)
     ax.legend()
     ax.set_ylim(0, 100)
     ax.grid(axis="y", alpha=0.3)
     story.append(Paragraph("2.1 Office Utilisation Trends", STYLES["SectionHead"]))
     story.append(_fig_to_rl_image(fig, width=6*inch, height=3*inch))
+
+    # Text summary table so PyPDFLoader can retrieve utilisation numbers
+    story.append(Paragraph("2.2 Monthly Utilisation Data – 2025", STYLES["SectionHead"]))
+    util_table_data = [["Month", "Utilisation (%)", "vs. Target (75%)"]]
+    for m, v in zip(months_labels, capacity):
+        delta = v - 75
+        delta_str = f"+{delta}%" if delta >= 0 else f"{delta}%"
+        util_table_data.append([m, f"{v}%", delta_str])
+    t = Table(util_table_data, colWidths=[1.5*inch, 1.5*inch, 1.5*inch])
+    t.setStyle(STD_TABLE_STYLE)
+    story.append(t)
     story.append(PageBreak())
 
     # Department rotation
@@ -508,10 +528,7 @@ def generate_rto_policy(df: pd.DataFrame | None):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def generate_salary_report(df: pd.DataFrame | None):
-    path = os.path.join(DOCS_DIR, "salary_bands_report.pdf")
-    doc = SimpleDocTemplate(path, pagesize=letter,
-                            leftMargin=0.75*inch, rightMargin=0.75*inch,
-                            topMargin=0.75*inch, bottomMargin=0.75*inch)
+    path, doc = _new_doc("salary_bands_report.pdf")
     story = []
     _title_page(story, "Salary Bands &\nCompensation Report")
 
@@ -528,13 +545,25 @@ def generate_salary_report(df: pd.DataFrame | None):
     bars = ax.barh(avg_sal.index, avg_sal.values, color=plt.cm.viridis(
         np.linspace(0.2, 0.9, len(avg_sal))))
     ax.set_xlabel("Average Salary ($)")
-    ax.set_title("Average Salary by Department", fontsize=14, fontweight="bold")
+    ax.set_title("Average Salary by Department", fontsize=14, fontweight="bold", pad=12)
     for bar, val in zip(bars, avg_sal.values):
         ax.text(val + 500, bar.get_y() + bar.get_height()/2,
                 f"${val:,.0f}", va="center", fontsize=8)
+    # Expand x-axis by 15% on the right so labels don't clip
+    xmax = avg_sal.max()
+    ax.set_xlim(0, xmax * 1.15)
     ax.grid(axis="x", alpha=0.3)
     fig.tight_layout()
     story.append(_fig_to_rl_image(fig, width=6*inch, height=3.5*inch))
+
+    # Text summary table so PyPDFLoader can extract numbers without OCR
+    story.append(Paragraph("1.1 Average Salary by Department — Summary", STYLES["SectionHead"]))
+    sal_table_data = [["Department", "Average Salary ($)"]]
+    for dept, val in avg_sal.sort_values(ascending=False).items():
+        sal_table_data.append([dept, f"${val:,.0f}"])
+    t = Table(sal_table_data, colWidths=[3*inch, 2*inch])
+    t.setStyle(STD_TABLE_STYLE)
+    story.append(t)
     story.append(PageBreak())
 
     # Salary distribution histogram
@@ -547,7 +576,7 @@ def generate_salary_report(df: pd.DataFrame | None):
                label=f'Median: ${df["salary"].median():,.0f}')
     ax.set_xlabel("Salary ($)")
     ax.set_ylabel("Number of Employees")
-    ax.set_title("Company-Wide Salary Distribution", fontsize=14, fontweight="bold")
+    ax.set_title("Company-Wide Salary Distribution", fontsize=14, fontweight="bold", pad=12)
     ax.legend()
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
@@ -582,15 +611,15 @@ def generate_salary_report(df: pd.DataFrame | None):
     ))
     band_data = [
         ["Seniority", "Min Salary", "Max Salary", "Target Midpoint", "Employees"],
-        ["Junior (0-1 yrs)", "$35,000", "$55,000", "$45,000",
+        ["Junior (0-1 yrs)", "$38,000", "$65,000", "$51,500",
          str(len(df[df["years_of_expertise"] < 2]))],
-        ["Mid (2-4 yrs)", "$55,000", "$85,000", "$70,000",
+        ["Mid (2-4 yrs)", "$60,000", "$95,000", "$77,500",
          str(len(df[(df["years_of_expertise"] >= 2) & (df["years_of_expertise"] < 5)]))],
-        ["Senior (5-9 yrs)", "$85,000", "$120,000", "$102,500",
+        ["Senior (5-9 yrs)", "$90,000", "$130,000", "$110,000",
          str(len(df[(df["years_of_expertise"] >= 5) & (df["years_of_expertise"] < 10)]))],
-        ["Lead/Manager (10-14 yrs)", "$100,000", "$160,000", "$130,000",
+        ["Lead/Manager (10-14 yrs)", "$110,000", "$165,000", "$137,500",
          str(len(df[(df["years_of_expertise"] >= 10) & (df["years_of_expertise"] < 15)]))],
-        ["Director/VP (15+ yrs)", "$140,000", "$220,000", "$180,000",
+        ["Director/VP (15+ yrs)", "$150,000", "$230,000", "$190,000",
          str(len(df[df["years_of_expertise"] >= 15]))],
     ]
     t = Table(band_data, colWidths=[1.5*inch, 1*inch, 1*inch, 1.1*inch, 0.9*inch])
@@ -605,7 +634,7 @@ def generate_salary_report(df: pd.DataFrame | None):
     labels = ["0-1y", "2-4y", "5-9y", "10-14y", "15y+"]
     df["exp_bin"] = pd.cut(df["years_of_expertise"], bins=bins, labels=labels, right=False)
     pivot = df.pivot_table(values="salary", index="department",
-                           columns="exp_bin", aggfunc="mean")
+                           columns="exp_bin", aggfunc="mean", observed=False)
     fig, ax = plt.subplots(figsize=(10, 6))
     im = ax.imshow(pivot.values, cmap="YlOrRd", aspect="auto")
     ax.set_xticks(range(len(pivot.columns)))
@@ -619,7 +648,7 @@ def generate_salary_report(df: pd.DataFrame | None):
                 ax.text(j, i, f"${val/1000:.0f}k", ha="center", va="center",
                         fontsize=7, color="black" if val < 120000 else "white")
     ax.set_title("Average Salary Heatmap ($k) by Department & Experience",
-                 fontsize=13, fontweight="bold")
+                 fontsize=13, fontweight="bold", pad=12)
     fig.colorbar(im, ax=ax, label="Salary ($)", shrink=0.8)
     fig.tight_layout()
     story.append(_fig_to_rl_image(fig, width=6.2*inch, height=3.8*inch))
@@ -635,11 +664,8 @@ def generate_salary_report(df: pd.DataFrame | None):
 # 5. BENEFITS GUIDE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def generate_benefits_guide(df: pd.DataFrame | None):
-    path = os.path.join(DOCS_DIR, "benefits_guide.pdf")
-    doc = SimpleDocTemplate(path, pagesize=letter,
-                            leftMargin=0.75*inch, rightMargin=0.75*inch,
-                            topMargin=0.75*inch, bottomMargin=0.75*inch)
+def generate_benefits_guide():
+    path, doc = _new_doc("benefits_guide.pdf")
     story = []
     _title_page(story, "Employee Benefits\n& Wellness Guide")
 
@@ -755,7 +781,7 @@ def generate_benefits_guide(df: pd.DataFrame | None):
                 f"${val:,}", ha="center", fontsize=8, fontweight="bold")
     ax.set_ylabel("Annual Value ($)")
     ax.set_title(f"Estimated Total Benefits Value: ${sum(values):,}/year",
-                 fontsize=13, fontweight="bold")
+                 fontsize=13, fontweight="bold", pad=12)
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     story.append(_fig_to_rl_image(fig, width=6*inch, height=3.3*inch))
@@ -769,10 +795,7 @@ def generate_benefits_guide(df: pd.DataFrame | None):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def generate_leave_report(df: pd.DataFrame | None):
-    path = os.path.join(DOCS_DIR, "leave_policy_report.pdf")
-    doc = SimpleDocTemplate(path, pagesize=letter,
-                            leftMargin=0.75*inch, rightMargin=0.75*inch,
-                            topMargin=0.75*inch, bottomMargin=0.75*inch)
+    path, doc = _new_doc("leave_policy_report.pdf")
     story = []
     _title_page(story, "Leave Policy &\nAbsence Analytics Report")
 
@@ -828,20 +851,22 @@ def generate_leave_report(df: pd.DataFrame | None):
         total_pto = df["paid_time_off_days"].sum()
         total_mh = df["mental_health_leave_days"].sum()
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-        # Pie chart
+        # ── Pie chart (standalone, full width) ──────────────────────────────
+        fig_pie, ax_pie = plt.subplots(figsize=(7, 4))
         leave_labels = ["Sick Leave", "Maternity", "Paternity", "PTO", "Mental Health"]
         leave_vals = [total_sick, total_mat, total_pat, total_pto, total_mh]
         pie_colors = ["#ef5350", "#ab47bc", "#42a5f5", "#66bb6a", "#ffa726"]
-        wedges, texts, autotexts = ax1.pie(
+        wedges, texts, autotexts = ax_pie.pie(
             leave_vals, labels=leave_labels, autopct="%1.1f%%",
             colors=pie_colors, startangle=90,
         )
         for t in texts + autotexts:
             t.set_fontsize(8)
-        ax1.set_title("Leave Distribution by Type", fontsize=12, fontweight="bold")
+        ax_pie.set_title("Leave Distribution by Type", fontsize=12, fontweight="bold", pad=12)
+        story.append(_fig_to_rl_image(fig_pie, width=5*inch, height=3*inch))
+        story.append(Spacer(1, 0.15*inch))
 
-        # Bar chart: avg leave by department
+        # ── Bar chart: avg leave by department (standalone, full width) ──────
         dept_leave = df.groupby("department").agg({
             "sick_leave_days": "mean",
             "paid_time_off_days": "mean",
@@ -849,20 +874,24 @@ def generate_leave_report(df: pd.DataFrame | None):
         }).sort_values("sick_leave_days", ascending=True)
         x_pos = np.arange(len(dept_leave))
         w = 0.25
-        ax2.barh(x_pos - w, dept_leave["sick_leave_days"], w,
-                 label="Sick", color="#ef5350")
-        ax2.barh(x_pos, dept_leave["paid_time_off_days"], w,
-                 label="PTO", color="#66bb6a")
-        ax2.barh(x_pos + w, dept_leave["mental_health_leave_days"], w,
-                 label="Mental Health", color="#ffa726")
-        ax2.set_yticks(x_pos)
-        ax2.set_yticklabels(dept_leave.index, fontsize=8)
-        ax2.set_xlabel("Average Days")
-        ax2.set_title("Avg Leave by Department", fontsize=12, fontweight="bold")
-        ax2.legend(fontsize=8)
-        ax2.grid(axis="x", alpha=0.3)
-        fig.tight_layout()
-        story.append(_fig_to_rl_image(fig, width=6.5*inch, height=3.2*inch))
+        fig_bar, ax_bar = plt.subplots(figsize=(8, 5))
+        ax_bar.barh(x_pos - w, dept_leave["sick_leave_days"], w,
+                    label="Sick", color="#ef5350")
+        ax_bar.barh(x_pos, dept_leave["paid_time_off_days"], w,
+                    label="PTO", color="#66bb6a")
+        ax_bar.barh(x_pos + w, dept_leave["mental_health_leave_days"], w,
+                    label="Mental Health", color="#ffa726")
+        ax_bar.set_yticks(x_pos)
+        ax_bar.set_yticklabels(dept_leave.index, fontsize=8)
+        ax_bar.set_xlabel("Average Days")
+        ax_bar.set_title("Average Leave by Department", fontsize=12, fontweight="bold", pad=12)
+        # Expand x-axis by 15% to prevent label clipping
+        ax_bar.set_xlim(0, dept_leave[["sick_leave_days", "paid_time_off_days",
+                                        "mental_health_leave_days"]].max().max() * 1.15)
+        ax_bar.legend(fontsize=8, loc="lower right")
+        ax_bar.grid(axis="x", alpha=0.3)
+        fig_bar.tight_layout()
+        story.append(_fig_to_rl_image(fig_bar, width=6*inch, height=3.5*inch))
         story.append(Spacer(1, 0.2*inch))
 
         # Summary table
@@ -905,7 +934,7 @@ def generate_leave_report(df: pd.DataFrame | None):
         ax1.fill_between(month_labels, monthly_avg, alpha=0.15, color="#1565c0")
         ax1.set_ylabel("Average Absent Days / Employee")
         ax1.set_title("Average Absence per Employee by Month",
-                      fontsize=13, fontweight="bold")
+                      fontsize=13, fontweight="bold", pad=12)
         ax1.grid(alpha=0.3)
 
         ax2.bar(month_labels, monthly_total, color="#ff8f00", alpha=0.85)
@@ -913,7 +942,7 @@ def generate_leave_report(df: pd.DataFrame | None):
             ax2.text(i, v + 20, str(int(v)), ha="center", fontsize=8)
         ax2.set_ylabel("Total Absent Days (All Employees)")
         ax2.set_title("Total Company Absence by Month",
-                      fontsize=13, fontweight="bold")
+                      fontsize=13, fontweight="bold", pad=12)
         ax2.grid(axis="y", alpha=0.3)
         fig.tight_layout()
         story.append(_fig_to_rl_image(fig, width=6*inch, height=4.2*inch))
@@ -959,10 +988,10 @@ def main():
 
     print("\nGenerating documents...")
     generate_employee_handbook(df)
-    generate_onboarding_policy(df)
-    generate_rto_policy(df)
+    generate_onboarding_policy()
+    generate_rto_policy()
     generate_salary_report(df)
-    generate_benefits_guide(df)
+    generate_benefits_guide()
     generate_leave_report(df)
     print("\n✅ All 6 documents generated in data/documents/")
 

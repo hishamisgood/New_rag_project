@@ -1,5 +1,7 @@
 .env
-.env.example
 __pycache__/
+*.pyc
 chroma_db/
 venv/
+.venv/
+rag_evaluation_report.json

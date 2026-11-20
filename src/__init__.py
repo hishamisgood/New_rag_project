@@ -1,0 +1,1 @@
+"""NovaCorp RAG application package."""

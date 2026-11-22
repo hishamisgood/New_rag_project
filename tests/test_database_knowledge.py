@@ -1,20 +1,38 @@
 import sqlite3
 from contextlib import closing
 
+import bcrypt
+
+from src import auth as auth_module
 from src import database as database_module
 
 
-def test_knowledge_seed_is_searchable(tmp_path, monkeypatch):
+def test_auth_hashes_passwords_and_authenticates_valid_credentials(tmp_path, monkeypatch):
     database = tmp_path / "employees.db"
-    monkeypatch.setattr(database_module, "DB_PATH", str(database))
+    monkeypatch.setattr(auth_module, "DB_PATH", str(database))
+    password_hash = auth_module.hash_password("correct-horse")
+    assert bcrypt.checkpw(b"correct-horse", password_hash.encode())
 
-    database_module.ensure_knowledge_base()
-    results = database_module.search_knowledge("When is payroll processed?")
-
-    assert results
-    assert any(row["key"] == "payroll" for row in results)
     with closing(sqlite3.connect(str(database))) as conn:
-        assert conn.execute("SELECT count(*) FROM rag_knowledge").fetchone()[0] >= 12
+        conn.execute(
+            "CREATE TABLE employees (id TEXT PRIMARY KEY, department TEXT, password_hash TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO employees VALUES (?, ?, ?)",
+            ("EMP00001", "Engineering", password_hash),
+        )
+        conn.commit()
+
+    employee = auth_module.authenticate("EMP00001", "correct-horse")
+    assert employee == {"id": "EMP00001", "department": "Engineering"}
+    assert auth_module.authenticate("EMP00001", "wrong-password") is None
+    assert auth_module.authenticate("EMP99999", "correct-horse") is None
+
+
+def test_get_access_level_uses_department():
+    assert auth_module.get_access_level({"department": "Human Resources"}) == "hr"
+    assert auth_module.get_access_level({"department": "Engineering"}) == "employee"
+    assert auth_module.get_access_level(None) == "employee"
 
 
 def test_ensure_transactional_tables_seeds_employee_rows_once(tmp_path, monkeypatch):
@@ -37,9 +55,7 @@ def test_ensure_transactional_tables_seeds_employee_rows_once(tmp_path, monkeypa
     database_module.ensure_transactional_tables()
     database_module.ensure_transactional_tables()
 
-    expected_tables = {
-        "expense_claims", "leave_requests", "payroll_history", "training_enrollments",
-    }
+    expected_tables = set(database_module.TRANSACTIONAL_TABLES)
     with closing(sqlite3.connect(str(database))) as conn:
         actual_tables = {
             row[0] for row in conn.execute(
@@ -80,23 +96,19 @@ def test_ensure_transactional_tables_seeds_employee_rows_once(tmp_path, monkeypa
         assert {f"idx_{table}_employee_id" for table in expected_tables} <= indexes
 
 
-def test_ingestion_appends_operational_facts_to_pdf_chunks(tmp_path, monkeypatch):
-    from langchain_core.documents import Document
+def test_ingestion_appends_operational_facts_to_pdf_chunks(tmp_path):
     from src import ingestion as ingestion_module
+    from reportlab.pdfgen import canvas
 
-    (tmp_path / "policy.pdf").touch()
-
-    class FakePDFLoader:
-        def __init__(self, _path):
-            pass
-
-        def load(self):
-            return [Document(page_content="Policy page", metadata={"page": 0})]
-
-    monkeypatch.setattr(ingestion_module, "PyPDFLoader", FakePDFLoader)
+    policy_path = tmp_path / "policy.pdf"
+    pdf = canvas.Canvas(str(policy_path))
+    pdf.drawString(72, 720, "A policy page with enough selectable text for ingestion.")
+    pdf.save()
     chunks = ingestion_module.load_and_split_documents(str(tmp_path))
 
     guide_chunks = [doc for doc in chunks if doc.metadata.get("source", "").startswith("company_guide:")]
     assert len(guide_chunks) == len(database_module.KNOWLEDGE_SEED)
     assert all(doc.page_content.startswith(doc.metadata["source"].split(":", 1)[1] + ":")
                for doc in guide_chunks)
+    assert all(doc.metadata["access_level"] == "public"
+               and doc.metadata["extraction_method"] == "seed" for doc in guide_chunks)

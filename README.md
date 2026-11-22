@@ -1,189 +1,126 @@
-# NovaCorp Employee RAG Portal 🏢
+# NovaCorp Employee RAG Portal
 
-A Retrieval-Augmented Generation (RAG) application for company employees, built with **Streamlit**, **LangChain**, **ChromaDB**, and **Google Gemini**.
+An employee-facing retrieval-augmented assistant built with Streamlit, LangChain Core,
+ChromaDB, and Google Gemini. It combines company policy documents, operational facts,
+role-scoped employee records, confirmation-gated HR actions, and optional public web search.
 
 ## Features
 
-- 🔐 **Secure Authentication** — SQLite-backed login with bcrypt-hashed passwords
-- 👤 **Employee Dashboard** — Personal profile with salary, leave stats, and monthly absence charts
-- 🤖 **Dynamic RAG Agent** — An LLM router selects policy retrieval or employee-scoped analytical SQL for each question
-- 🧠 **Resilient LLMs** — Gemini is preferred, with local Ollama `llama3.2` as the automatic fallback; BM25 keeps retrieval available offline
-- 🔍 **Hybrid Search** — ChromaDB + BM25 with reciprocal-rank fusion indexes policies and 12 operational facts
-- 📊 **Employee Analytics** — Read-only SQL over expense claims, leave requests, payroll history, and training enrollments
-- 📄 **Rich Documents** — PDFs with charts, tables, and complex layouts
+- SQLite authentication with bcrypt password hashes and an employee profile dashboard.
+- A router for policy retrieval, read-only SQL, HR actions, and external web search.
+- Hybrid policy retrieval using ChromaDB and the project's custom `RRFRetriever`.
+- Role-based access control for documents, SQL data, and action permissions.
+- Proposals for leave requests and expense claims that require explicit confirmation before writing.
+- Optional Tavily or Serper search for public information outside NovaCorp's policies.
+- Table-aware extraction for long, multi-page PDFs and RapidOCR fallback for scanned pages.
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                         Streamlit UI                             │
-│  Login + Profile ── SQLite employees table                       │
-│                                                                  │
-│  Chat ── Condense follow-up ── Dynamic LLM Router                │
-│                                  ├─ POLICY ─ Hybrid RRF Search    │
-│                                  │           ├─ ChromaDB          │
-│                                  │           │  6 PDFs + 12 facts │
-│                                  │           └─ BM25              │
-│                                  └─ SQL ─ Read-only scoped SQLite │
-│                                            ├─ expense_claims      │
-│                                            ├─ leave_requests      │
-│                                            ├─ payroll_history     │
-│                                            └─ training_enrollments│
-│                                                                  │
-│  Gemini ── automatic fallback to Ollama llama3.2                 │
-│  No Google key ── BM25 policy retrieval remains available         │
-└──────────────────────────────────────────────────────────────────┘
-```
+The RAG chain is plain `langchain_core`; the project has zero `langchain_classic` dependency.
+The custom `RRFRetriever` combines semantic and BM25 results. When Gemini embeddings are
+unavailable, BM25 retrieval remains available offline.
 
-## Quick Start
+The assistant routes each question to one of four paths:
 
-### 1. Install Dependencies
+1. **Policy search:** hybrid retrieval over generated PDFs and 12 operational seed facts.
+2. **SQL:** generated read-only SQLite queries validated against approved tables and columns.
+3. **HR actions:** a structured proposal for a leave request or expense claim, followed by
+   a user confirmation card before any database write.
+4. **Public web search:** optional Tavily or Serper results for external questions.
+
+### Role-based access
+
+Standard employees retrieve public documents and can query only their own employee and
+transaction records. Human Resources users can retrieve HR-only compensation documents
+and run company-wide SQL queries. Only HR users can approve or reject leave requests and
+expense claims; employees may submit their own requests. SQL is read-only and HR writes use
+fixed, parameterized statements.
+
+Document access is stored in each chunk's `access_level` metadata. The salary bands report
+and scanned HR audit memo are tagged `hr_only`; other policy documents are public. SQL
+scoping and action permissions are enforced independently of the document retriever.
+
+### PDF extraction
+
+`src/ingestion.py` uses PyMuPDF and pdfplumber to separate table regions from surrounding
+prose. Large tables are chunked by row group with their Markdown header repeated on every
+chunk, including later pages. Narrative text beneath a table is extracted separately.
+Pages with fewer than 40 characters of selectable text are rendered at 200 DPI and read
+with RapidOCR (`rapidocr-onnxruntime`), so both image-only PDFs and scanned pages inside
+otherwise native-text PDFs enter the same retrieval index. Each chunk records its source,
+page, access level, and extraction method.
+
+Generated material includes 3-page benefits and travel schedules, a 4-page compensation
+directory, two standalone scanned addenda/memos, and a scanned bereavement appendix page
+in the leave policy report.
+
+## Quick start
+
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Set Up API Key
+Create `.env` from `.env.example` and set `GOOGLE_API_KEY` for Gemini embeddings and answers.
+Generate the demo data and documents, then build the vector store:
 
 ```bash
-cp .env.example .env
-# Edit .env and add your Google API key from https://aistudio.google.com/app/apikey
-```
-
-### 3. Generate Data & Build Knowledge Base
-
-```bash
-# Step 1: Generate 2,000 synthetic employees
 python scripts/generate_employees.py
-
-# Step 2: Load employees into SQLite (with hashed passwords)
 python scripts/init_db.py
-
-# Step 3: Generate PDF documents (policies, reports with charts/tables)
 python scripts/generate_documents.py
-
-# Step 4: Ingest documents into ChromaDB vector store
 python scripts/build_vectorstore.py
-```
-
-### 4. Run the Application
-
-```bash
 streamlit run app.py
 ```
 
-### 5. Log In
+`data/employees.xlsx` contains synthetic plaintext demo credentials for local sign-in.
+It is demo data, not a secure credential store. Authentication uses bcrypt hashes in SQLite.
 
-`data/employees.xlsx` contains synthetic test credentials for demo login (ID + password columns).
-
-Example: Log in with `EMP00001` and the corresponding password from the Excel file.
-
-## Project Structure
-
-```
-NEW_RAG_Project/
-├── app.py                      # Streamlit UI (streamlit run app.py)
-├── src/
-│   ├── __init__.py
-│   ├── config.py               # Shared paths and model names
-│   ├── database.py             # SQLite employees, knowledge, and transactions
-│   ├── auth.py                 # Password hashing and login verification
-│   ├── ingestion.py            # PDF chunks and operational facts
-│   ├── retriever.py            # Embeddings, ChromaDB, and hybrid search
-│   ├── llm.py                  # Gemini with Ollama fallback
-│   ├── sql_tool.py             # Read-only generated SQL
-│   └── agent.py                # RAG chain, router, and agent
-├── scripts/
-│   ├── generate_employees.py
-│   ├── generate_documents.py
-│   ├── init_db.py
-│   ├── build_vectorstore.py
-│   ├── evaluate_rag.py
-│   └── verify_upgrade.py
-├── tests/
-│   ├── conftest.py
-│   ├── test_database_knowledge.py
-│   ├── test_llm_sql_tool.py
-│   └── test_rag_agent.py
-├── requirements.txt            # Python dependencies
-├── .env.example                # Environment variables template
-├── data/
-│   ├── employees.xlsx          # Generated employee data
-│   ├── employees.db            # SQLite database
-│   └── documents/              # Generated PDF documents
-│       ├── employee_handbook.pdf
-│       ├── onboarding_policy.pdf
-│       ├── return_to_office_policy.pdf
-│       ├── salary_bands_report.pdf
-│       ├── benefits_guide.pdf
-│       └── leave_policy_report.pdf
-└── chroma_db/                  # ChromaDB persistent vector store
-```
-
-## Documents Generated
-
-| Document | Content | Visual Elements |
-|----------|---------|-----------------|
-| Employee Handbook | Company overview, code of conduct, performance review | Dept pie chart, disciplinary action table, performance rating table |
-| Onboarding Policy | 30/60/90 day plan, checklists, training modules | Multi-column tables, IT setup table |
-| Return to Office Policy | Hybrid schedule, safety guidelines | Office utilisation bar chart, rotation table |
-| Salary Bands Report | Compensation analysis across departments | Salary histogram, heatmap, bar chart |
-| Benefits Guide | Health insurance, retirement, wellness | Plan comparison tables, benefits value bar chart |
-| Leave Policy Report | Leave types, absence analytics | Pie chart, bar chart, monthly trends |
-
-## How It Works
-
-### Authentication
-1. Employee enters ID + password in the login form
-2. SQLite lookup with bcrypt hash verification
-3. Employee profile loaded into session state
-
-### RAG Pipeline
-1. **Document Loading**: PDFs loaded with PyPDFLoader
-2. **Chunking**: RecursiveCharacterTextSplitter (1000 chars, 200 overlap)
-3. **Embeddings**: Google Generative AI Embeddings (`models/gemini-embedding-001`)
-4. **Vector Store**: ChromaDB (persistent on disk)
-5. **Hybrid Search**: RRFRetriever (Reciprocal Rank Fusion) combines:
-   - ChromaDB semantic search (50% weight)
-   - BM25 keyword search (50% weight)
-6. **LLM**: Gemini generates answers from retrieved context + employee profile
-7. **History**: Bounded list (last 20 messages = 10 exchanges) stored on RAGAgent
-
-### Operational facts and transactional analytics
-
-The six policy PDFs and 12 static operational facts (including payroll timing,
-IT support, HR response SLAs, the remote stipend, and holidays) are indexed in
-ChromaDB and BM25. The LLM router sends employee transaction questions to
-read-only, employee-scoped SQL over `expense_claims`, `leave_requests`,
-`payroll_history`, and `training_enrollments`. It can combine SQL results with
-retrieved policies, such as comparing training spend with the annual budget.
-The app creates and seeds these tables at startup. Run the offline checks with:
+The 12 static operational facts are defined in `src/database.py` as `KNOWLEDGE_SEED`.
+After editing those facts, rebuild ChromaDB with:
 
 ```bash
+python scripts/build_vectorstore.py
+```
+
+## Generated documents
+
+The six native-text policy PDFs cover the employee handbook, onboarding, return-to-office,
+salary bands, benefits, and leave. The generator also creates:
+
+- `scanned_remote_work_addendum_2026.pdf` — two image-only public pages.
+- `scanned_hr_audit_memo_2026.pdf` — one image-only HR-only page.
+- A final image-only sign-off and bereavement addendum page in `leave_policy_report.pdf`.
+
+## Evaluation and checks
+
+```bash
+pytest
+python scripts/verify_upgrade.py
 python scripts/evaluate_rag.py --dry-run
 ```
 
-For end-to-end evaluation, build ChromaDB and ensure Gemini or Ollama is
-available, then run `python scripts/evaluate_rag.py`.
+The dry run checks seed coverage and transaction tables without calling an LLM. Live
+evaluation also checks expected facts and source retrieval, including later-page table
+rows, scanned OCR facts, and HR-scoped cases.
 
-### Employee Context
-When a user logs in, their full profile (salary, department, leave days, etc.)
-is injected into the LLM system prompt. This allows questions like:
-- "What is my salary?"
-- "How many sick days do I have?"
-- "Am I eligible for paternity leave?"
+## Project structure
 
-## Tech Stack
-
-| Component | Technology |
-|-----------|-----------|
-| Frontend | Streamlit |
-| Auth | SQLite + bcrypt |
-| LLM | Google Gemini (via langchain-google-genai) |
-| Embeddings | Google Generative AI Embeddings |
-| Vector Store | ChromaDB |
-| Keyword Search | BM25 (rank-bm25) |
-| Hybrid Search | Custom RRFRetriever (Reciprocal Rank Fusion, zero langchain_classic) |
-| Data Generation | Faker |
-| PDF Generation | ReportLab + Matplotlib |
-| PDF Parsing | PyPDF |
+```text
+app.py
+src/
+  agent.py                 # Router, plain langchain_core chain, and tool context
+  action_tool.py           # Confirmation-gated leave and expense writes
+  auth.py                  # Authentication and access-level mapping
+  database.py              # Employee data, transactions, and KNOWLEDGE_SEED
+  ingestion.py             # Table-aware PDF extraction and RapidOCR fallback
+  retriever.py             # Custom RRFRetriever and role filters
+  sql_tool.py              # Validated, read-only SQLite queries
+  web_search_tool.py       # Tavily and Serper adapters
+scripts/
+  generate_documents.py    # Native policy PDFs and scanned-image PDFs
+  build_vectorstore.py
+  evaluate_rag.py
+  verify_upgrade.py
+tests/
+```

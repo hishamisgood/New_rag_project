@@ -91,8 +91,9 @@ def create_hybrid_retriever(
     vectorstore: Chroma,
     k: int = 5,
     semantic_weight: float = 0.5,
+    access_level: str = "employee",
 ) -> BaseRetriever:
-    """Combine semantic ChromaDB retrieval with BM25 keyword retrieval via RRF."""
+    """Combine role-filtered semantic and BM25 retrieval via RRF."""
     stored = vectorstore._collection.get(include=["documents", "metadatas"])
 
     if not stored["documents"]:
@@ -102,6 +103,14 @@ def create_hybrid_retriever(
         Document(page_content=text, metadata=metadata or {})
         for text, metadata in zip(stored["documents"], stored["metadatas"])
     ]
+    if access_level != "hr":
+        documents = [
+            document for document in documents
+            if document.metadata.get("access_level", "public") == "public"
+        ]
+    if not documents:
+        raise ValueError(f"No documents are available for access level '{access_level}'.")
+
     bm25_retriever = BM25Retriever.from_documents(documents)
     bm25_retriever.k = k
 
@@ -110,9 +119,12 @@ def create_hybrid_retriever(
         return bm25_retriever
 
     try:
+        search_kwargs = {"k": k}
+        if access_level != "hr":
+            search_kwargs["filter"] = {"access_level": "public"}
         vector_retriever = vectorstore.as_retriever(
             search_type="similarity",
-            search_kwargs={"k": k},
+            search_kwargs=search_kwargs,
         )
     except Exception:
         return bm25_retriever

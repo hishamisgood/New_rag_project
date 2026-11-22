@@ -11,6 +11,7 @@ Run with:  streamlit run app.py
 """
 
 import html
+import logging
 import os
 import streamlit as st
 from dotenv import load_dotenv
@@ -25,14 +26,17 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-from src.auth import authenticate
+from src.action_tool import PendingAction
+from src.auth import authenticate, get_access_level
 from src.config import DB_PATH
-from src.database import ensure_knowledge_base, ensure_transactional_tables
+from src.database import ensure_transactional_tables
 from src.agent import build_rag_agent, query_rag
 from src.retriever import (
     load_vectorstore,
     create_hybrid_retriever,
 )
+
+logger = logging.getLogger(__name__)
 
 # ── Custom CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
@@ -71,6 +75,7 @@ def init_session_state(reset: bool = False) -> None:
         "chat_history": [],
         "rag_chain": None,
         "pending_prompt": None,
+        "pending_action": None,
     }
     for key, val in defaults.items():
         if reset or key not in st.session_state:
@@ -154,6 +159,8 @@ def show_sidebar_profile():
         ln = html.escape(str(emp['last_name']))
         role = html.escape(str(emp['role']))
         dept = html.escape(str(emp['department']))
+        access_level = get_access_level(emp)
+        access_badge = "🔑 HR Admin Access" if access_level == "hr" else "👤 Employee Access"
         st.markdown(f"""
         <div class="profile-card">
             <h3>👤 {fn} {ln}</h3>
@@ -163,6 +170,7 @@ def show_sidebar_profile():
             </p>
         </div>
         """, unsafe_allow_html=True)
+        st.markdown(f"**{access_badge}**")
 
         st.markdown("##### 📋 Profile Details")
         st.markdown(f"**ID:** `{emp['id']}`")
@@ -211,30 +219,64 @@ def show_sidebar_profile():
 # RAG INITIALISATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_resource(show_spinner="Seeding knowledge base...")
-def _ensure_knowledge_base_cached():
-    """Seed knowledge tables once per server process."""
-    ensure_knowledge_base()
+@st.cache_resource(show_spinner="Preparing employee records...")
+def _ensure_transactional_tables_cached():
+    """Ensure employee transaction tables are ready once per server process."""
     ensure_transactional_tables()
 
 
 @st.cache_resource(show_spinner="Loading knowledge base...")
-def init_rag():
+def init_rag(access_level: str):
     """Load vector store and create hybrid retriever (cached)."""
     vectorstore = load_vectorstore()
-    retriever = create_hybrid_retriever(vectorstore, k=5, semantic_weight=0.5)
+    retriever = create_hybrid_retriever(
+        vectorstore, k=5, semantic_weight=0.5, access_level=access_level
+    )
     return retriever
 
 
 def get_rag_chain():
     """Get or create the tool-using RAG agent for the current session."""
     if st.session_state.rag_chain is None:
-        retriever = init_rag()
+        employee = st.session_state.employee
+        access_level = get_access_level(employee)
+        retriever = init_rag(access_level)
         st.session_state.rag_chain = build_rag_agent(
             retriever=retriever,
-            employee_info=st.session_state.employee,
+            employee_info=employee,
         )
     return st.session_state.rag_chain
+
+
+def _render_pending_action() -> None:
+    """Show a confirmation card and execute an action only after confirmation."""
+    pending_action: PendingAction | None = st.session_state.pending_action
+    if pending_action is None:
+        return
+
+    with st.container(border=True):
+        st.markdown("#### Review this HR action")
+        st.write(pending_action.summary)
+        confirm_col, cancel_col = st.columns(2)
+        with confirm_col:
+            if st.button("✅ Confirm", key="confirm_hr_action", type="primary"):
+                try:
+                    confirmation = get_rag_chain().action_tool.execute(pending_action)
+                except Exception:
+                    logger.exception("HR action execution failed")
+                    confirmation = "I couldn't complete that action. Please try again later."
+                st.session_state.chat_history.append({
+                    "role": "assistant", "content": confirmation,
+                })
+                st.session_state.pending_action = None
+                st.rerun()
+        with cancel_col:
+            if st.button("❌ Cancel", key="cancel_hr_action"):
+                st.session_state.chat_history.append({
+                    "role": "assistant", "content": "The proposed action was cancelled.",
+                })
+                st.session_state.pending_action = None
+                st.rerun()
 
 
 def _render_message_metadata(sources, tools_used, sql):
@@ -272,7 +314,7 @@ def show_chat():
         "combine those records with relevant policy documents."
     )
     with st.expander("How the assistant answers", expanded=False):
-        st.caption("The assistant routes each question dynamically to hybrid policy search or read-only, employee-scoped SQLite queries. Gemini is preferred; Ollama llama3.2 is used automatically if Gemini is unavailable.")
+        st.caption("Questions route to hybrid policy search, role-scoped SQL, confirmation-gated HR actions, or public web search. Gemini is preferred; Ollama llama3.2 is used automatically if Gemini is unavailable.")
     st.markdown("---")
 
     # Display chat history
@@ -282,6 +324,10 @@ def show_chat():
             _render_message_metadata(
                 msg.get("sources", []), msg.get("tools_used", []), msg.get("sql")
             )
+
+    if st.session_state.pending_action is not None:
+        _render_pending_action()
+        return
 
     # Pop a staged suggestion so it is handled only once after rerun.
     prompt = st.chat_input("Ask a question...") or st.session_state.pop("pending_prompt", None)
@@ -303,13 +349,12 @@ def show_chat():
                     sources = result["sources"]
                     tools_used = result.get("tools_used", [])
                     sql = result.get("sql")
-                except Exception as e:
-                    answer = (
-                        f"⚠️ I encountered an error: {str(e)}\n\n"
-                        "Please make sure your `GOOGLE_API_KEY` is set in the "
-                        "`.env` file and that the vector store has been built "
-                        "(`python scripts/build_vectorstore.py`)."
-                    )
+                    pending_action = result.get("pending_action")
+                    if pending_action is not None:
+                        st.session_state.pending_action = pending_action
+                except Exception:
+                    logger.exception("Chat query failed")
+                    answer = "I couldn't complete that request right now. Please try again later."
                     sources = []
                     tools_used = []
                     sql = None
@@ -326,10 +371,13 @@ def show_chat():
             "sql": sql,
         })
 
+        if st.session_state.pending_action is not None:
+            st.rerun()
+
     # Suggested questions
     if not st.session_state.chat_history:
         st.markdown("#### 💡 Try asking:")
-        suggestions = [
+        common_suggestions = [
             "What is my salary and department?",
             "What is the return to office policy?",
             "How many sick leave days do I have?",
@@ -341,10 +389,24 @@ def show_chat():
             "How much have I been reimbursed for travel this year?",
             "Which of my expense claims are still pending approval?",
             "What was my net pay in September and did I receive a bonus in 2026?",
-            "How much of my $3,000 annual Learning & Development budget do I have left?",
-            "What is the status of my recent leave requests?",
-            "How much have I claimed for Books, and how much of the $300 book allowance remains?",
         ]
+        access_level = get_access_level(emp)
+        if access_level == "hr":
+            suggestions = common_suggestions + [
+                "Show pending leave requests across the company.",
+                "Show expense claim totals by category across the company.",
+                "Approve leave request 123.",
+                "Reject expense claim 456.",
+            ]
+        else:
+            suggestions = common_suggestions + [
+                "Submit PTO leave from 2026-12-01 to 2026-12-03 for 3 days.",
+                "Submit a Meals expense claim for $45.50: lunch with a client.",
+                "What are the IRS 401(k) contribution limits for 2026?",
+                "How much of my $3,000 annual Learning & Development budget do I have left?",
+                "What is the status of my recent leave requests?",
+                "How much have I claimed for Books, and how much of the $300 book allowance remains?",
+            ]
         cols = st.columns(2)
         for i, suggestion in enumerate(suggestions):
             with cols[i % 2]:
@@ -373,7 +435,7 @@ def main():
         )
         return
 
-    _ensure_knowledge_base_cached()
+    _ensure_transactional_tables_cached()
 
     if not os.getenv("GOOGLE_API_KEY"):
         st.warning(

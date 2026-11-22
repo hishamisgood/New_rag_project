@@ -14,7 +14,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.config import DB_PATH
 from src.database import (
     KNOWLEDGE_SEED,
-    ensure_knowledge_base,
     ensure_transactional_tables,
     get_employee,
     TRANSACTIONAL_TABLES,
@@ -22,17 +21,25 @@ from src.database import (
 
 TEST_EMPLOYEE = "EMP00001"
 EVALUATION_SET = [
-    {"kind": "pdf", "question": "What are the core conduct expectations?", "expected_source": "employee_handbook.pdf"},
-    {"kind": "pdf", "question": "What should I complete during my first 30 days?", "expected_source": "onboarding_policy.pdf"},
-    {"kind": "pdf", "question": "How often am I expected to work from the office?", "expected_source": "return_to_office_policy.pdf"},
-    {"kind": "pdf", "question": "What salary band applies to a senior engineer?", "expected_source": "salary_bands_report.pdf"},
-    {"kind": "pdf", "question": "What health plan benefits and copays are available?", "expected_source": "benefits_guide.pdf"},
-    {"kind": "pdf", "question": "How much paid leave can employees take?", "expected_source": "leave_policy_report.pdf"},
-    {"kind": "guide", "question": "When is payroll processed?", "guide_key": "payroll", "expected_source": "company_guide:Payroll schedule"},
-    {"kind": "guide", "question": "Where can I get IT support?", "guide_key": "it_support", "expected_source": "company_guide:IT support"},
-    {"kind": "guide", "question": "What is the HR service-level agreement?", "guide_key": "hr_sla", "expected_source": "company_guide:HR service-level agreement"},
-    {"kind": "guide", "question": "What is the remote-work stipend?", "guide_key": "remote_stipend", "expected_source": "company_guide:Remote-work stipend"},
-    {"kind": "guide", "question": "How many company holidays do we get?", "guide_key": "holidays", "expected_source": "company_guide:Company holidays"},
+    {"kind": "pdf", "question": "What are the core conduct expectations?", "expected_source": "employee_handbook.pdf", "expected_facts": ["confidentiality", "integrity"]},
+    {"kind": "pdf", "question": "What should I complete during my first 30 days?", "expected_source": "onboarding_policy.pdf", "expected_facts": ["30 days", "security"]},
+    {"kind": "pdf", "question": "How often am I expected to work from the office?", "expected_source": "return_to_office_policy.pdf", "expected_facts": ["3 days", "manager"]},
+    {"kind": "pdf", "question": "What salary band applies to a senior engineer?", "expected_source": "salary_bands_report.pdf", "access_level": "hr", "expected_facts": ["$90,000", "$130,000"]},
+    {"kind": "pdf", "question": "What health plan benefits and copays are available?", "expected_source": "benefits_guide.pdf", "expected_facts": ["$30", "deductible"]},
+    {"kind": "pdf", "question": "How much paid leave can employees take?", "expected_source": "leave_policy_report.pdf", "expected_facts": ["15-25 days", "manager"]},
+    {"kind": "pdf", "question": "What does benefits matrix row BEN-063 say about emergency authorization?", "expected_source": "benefits_guide.pdf", "expected_facts": ["BEN-063", "48 hours"]},
+    {"kind": "pdf", "question": "What is the emergency out-of-network pre-authorization exception?", "expected_source": "benefits_guide.pdf", "expected_facts": ["48 hours", "stabilization"]},
+    {"kind": "pdf", "question": "What destination and lodging cap are listed for schedule TRV-068?", "expected_source": "employee_handbook.pdf", "expected_facts": ["TRV-068", "Japan"]},
+    {"kind": "pdf", "question": "What role and band minimum are listed for role NC-087?", "expected_source": "salary_bands_report.pdf", "access_level": "hr", "expected_facts": ["NC-087", "$178,000"]},
+    {"kind": "pdf", "question": "What does the signed 2026 international remote-work addendum allow?", "expected_source": "scanned_remote_work_addendum_2026.pdf", "expected_facts": ["30 calendar days", "14 days"]},
+    {"kind": "pdf", "question": "What ergonomic chair amount supersedes the older allowance?", "expected_source": "scanned_remote_work_addendum_2026.pdf", "expected_facts": ["$150", "2025"]},
+    {"kind": "pdf", "question": "How many paid bereavement days does the 2026 appendix grant for immediate family?", "expected_source": "leave_policy_report.pdf", "expected_facts": ["10", "immediate family"]},
+    {"kind": "pdf", "question": "What is the Q4 2026 merit pool and executive approval threshold?", "expected_source": "scanned_hr_audit_memo_2026.pdf", "access_level": "hr", "expected_facts": ["4.5%", "$180,000"]},
+    {"kind": "guide", "question": "When is payroll processed?", "guide_key": "payroll", "expected_source": "company_guide:Payroll schedule", "expected_facts": ["final business day"]},
+    {"kind": "guide", "question": "Where can I get IT support?", "guide_key": "it_support", "expected_source": "company_guide:IT support", "expected_facts": ["service desk portal"]},
+    {"kind": "guide", "question": "What is the HR service-level agreement?", "guide_key": "hr_sla", "expected_source": "company_guide:HR service-level agreement", "expected_facts": ["5 business days"]},
+    {"kind": "guide", "question": "What is the remote-work stipend?", "guide_key": "remote_stipend", "expected_source": "company_guide:Remote-work stipend", "expected_facts": ["$1,000", "$75"]},
+    {"kind": "guide", "question": "How many company holidays do we get?", "guide_key": "holidays", "expected_source": "company_guide:Company holidays", "expected_facts": ["11 federal holidays"]},
     {"kind": "sql", "question": "How much have I been reimbursed for travel this year?", "table": "expense_claims", "query_key": "travel"},
     {"kind": "sql", "question": "Which of my expense claims are still pending approval?", "table": "expense_claims", "query_key": "pending_expenses"},
     {"kind": "sql", "question": "What was my net pay in September and did I receive a bonus in 2026?", "table": "payroll_history", "query_key": "september_pay"},
@@ -76,7 +83,6 @@ REFUSAL_MARKERS = (
 
 
 def _dry_run() -> dict:
-    ensure_knowledge_base()
     ensure_transactional_tables()
     seeded_facts = {key: title for key, title, _content in KNOWLEDGE_SEED}
     guide_cases = [case for case in EVALUATION_SET if case["kind"] == "guide"]
@@ -130,40 +136,72 @@ def _dry_run() -> dict:
         "passed": sum(result["passed"] for result in results),
         "skipped_live_only": skipped,
         "transactional_tables": table_checks,
+        "sql_validation_rejections": 0,
         "cases": results,
     }
 
 
+def _get_hr_employee() -> dict:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT id FROM employees WHERE department = 'Human Resources' ORDER BY id LIMIT 1"
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("No Human Resources employee is available for HR evaluation cases.")
+    employee = get_employee(row[0])
+    if employee is None:
+        raise RuntimeError("The Human Resources evaluation profile could not be loaded.")
+    return employee
+
+
 def _live_evaluate() -> dict:
-    ensure_knowledge_base()
     ensure_transactional_tables()
     from src.agent import build_rag_agent, query_rag
     from src.retriever import create_hybrid_retriever, load_vectorstore
 
-    agent = build_rag_agent(
-        create_hybrid_retriever(load_vectorstore()),
-        employee_info=get_employee(TEST_EMPLOYEE),
-    )
+    vectorstore = load_vectorstore()
+    employee_info = get_employee(TEST_EMPLOYEE)
+    agents = {}
     results = []
     for case in EVALUATION_SET:
+        access_level = case.get("access_level", "employee")
+        if access_level not in agents:
+            profile = _get_hr_employee() if access_level == "hr" else employee_info
+            agents[access_level] = build_rag_agent(
+                create_hybrid_retriever(vectorstore, access_level=access_level),
+                employee_info=profile,
+            )
+        agent = agents[access_level]
         answer = query_rag(agent, case["question"])
         sources = answer["sources"]
+        answer_text = answer["answer"].lower()
         if case["kind"] == "refusal":
-            answer_text = answer["answer"].lower()
             passed = any(marker in answer_text for marker in REFUSAL_MARKERS)
         else:
             expected = case.get("expected_source", f"database:{case.get('table', '')}")
-            passed = any(source == expected or source.startswith(expected + " (p. ") for source in sources)
+            source_found = any(
+                source == expected or source.startswith(expected + " (p. ")
+                for source in sources
+            )
+            facts_found = all(
+                fact.lower() in answer_text for fact in case.get("expected_facts", [])
+            )
+            passed = source_found and facts_found
         results.append({
             **case,
             "sources": sources,
             "answer": answer["answer"],
+            "facts_found": all(fact.lower() in answer_text
+                               for fact in case.get("expected_facts", [])),
             "passed": passed,
         })
     return {
         "mode": "live",
         "total": len(results),
         "passed": sum(item["passed"] for item in results),
+        "sql_validation_rejections": sum(
+            agent.database_tool.validation_failures for agent in agents.values()
+        ),
         "cases": results,
     }
 

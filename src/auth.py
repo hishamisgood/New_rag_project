@@ -28,3 +28,10 @@ def authenticate(employee_id: str, password: str) -> dict | None:
     employee = dict(row)
     employee.pop("password_hash", None)
     return employee
+
+
+def get_access_level(employee: dict | None) -> str:
+    """Return the access level for an employee profile."""
+    if (employee or {}).get("department") == "Human Resources":
+        return "hr"
+    return "employee"

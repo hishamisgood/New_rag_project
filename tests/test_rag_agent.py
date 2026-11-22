@@ -4,7 +4,7 @@ import pytest
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage
 
-from src.agent import RAGAgent, query_rag
+from src.agent import RAGAgent, build_rag_chain, query_rag
 from src.sql_tool import ToolResult
 
 
@@ -25,11 +25,29 @@ def _fake_vectorstore(documents, metadatas):
 def _stub_sql_tool(monkeypatch, agent, documents, detail):
     calls = []
 
-    def run(question, employee_id):
-        calls.append((question, employee_id))
+    def run(question, employee_id, access_level="employee"):
+        calls.append((question, employee_id, access_level))
         return ToolResult(agent.database_tool.name, documents, detail)
 
     monkeypatch.setattr(agent.database_tool, "run", run)
+    return calls
+
+
+def _stub_post(monkeypatch, payload):
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return payload
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    monkeypatch.setattr("src.web_search_tool.requests.post", fake_post)
     return calls
 
 
@@ -54,11 +72,13 @@ class FakeChain:
     def __init__(self, base_retriever):
         self.base_retriever = base_retriever
         self.received_values = None
+        self.retrieved_documents = None
 
     def invoke(self, values):
         assert set(values) == {"input", "chat_history"}
         self.received_values = values
         documents = self.base_retriever.invoke(values["input"])
+        self.retrieved_documents = documents
         return {"answer": "Use the service desk.", "context": documents}
 
 
@@ -73,7 +93,7 @@ class FakeLLM:
         self.prompts.append(prompt_text)
         if "Rewrite the latest employee question" in prompt_text:
             return type("Response", (), {"content": self.standalone or "Which leave request is pending?"})()
-        if "Choose the one data source" in prompt_text:
+        if "Choose the one operation" in prompt_text:
             return type("Response", (), {"content": self.route})()
         return type("Response", (), {"content": "SELECT SUM(amount) FROM expense_claims "
                                               "WHERE employee_id = :employee_id"})()
@@ -97,7 +117,7 @@ def test_dynamic_router_runs_sql_for_transactional_question(monkeypatch):
 
     result = query_rag(agent, "How much did I spend on travel?")
 
-    assert calls == [("How much did I spend on travel?", "EMP00001")]
+    assert calls == [("How much did I spend on travel?", "EMP00001", "employee")]
     assert "How much did I spend on travel?" in llm.prompts[0]
     assert chain.received_values["input"] == "How much did I spend on travel?"
     assert retriever.last_question == "How much did I spend on travel?"
@@ -139,7 +159,7 @@ def test_followup_is_condensed_before_router_and_sql_tool(monkeypatch):
     agent.invoke("And which are still pending?")
 
     standalone = "Which of my expense claims are still pending approval?"
-    assert calls == [(standalone, "EMP00001")]
+    assert calls == [(standalone, "EMP00001", "employee")]
     assert standalone in llm.prompts[-1]
     assert "And which are still pending?" not in llm.prompts[-1]
     assert chain.received_values["input"] == standalone
@@ -229,3 +249,117 @@ def test_create_hybrid_retriever_raises_on_empty_store():
     fake_vectorstore = _fake_vectorstore([], [])
     with pytest.raises(ValueError, match="Vector store is empty"):
         retriever_module.create_hybrid_retriever(fake_vectorstore())
+
+
+def test_build_rag_chain_uses_plain_langchain_core(monkeypatch):
+    from langchain_core.messages import AIMessage
+    from src import agent as agent_module
+
+    document = Document(page_content="Company policy context", metadata={"source": "policy.pdf"})
+
+    class ContextCheckingLLM:
+        def invoke(self, prompt):
+            assert "Company policy context" in prompt.to_string()
+            return AIMessage(content="Answer from context")
+
+    monkeypatch.setattr(agent_module, "get_llm", lambda **_kwargs: ContextCheckingLLM())
+    chain = build_rag_chain(FakeRetriever([document]), model="fake-model")
+    result = chain.invoke({"input": "What is the policy?", "chat_history": []})
+
+    assert result["answer"] == "Answer from context"
+    assert result["context"] == [document]
+
+
+def test_role_filtered_hybrid_retriever_filters_bm25_documents(monkeypatch):
+    from src import retriever as retriever_module
+
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    documents = [
+        "Public office holiday schedule",
+        "Confidential HR compensation investigation",
+    ]
+    metadatas = [
+        {"source": "holidays.pdf", "access_level": "public"},
+        {"source": "hr_notes.pdf", "access_level": "hr_only"},
+    ]
+    employee_retriever = retriever_module.create_hybrid_retriever(
+        _fake_vectorstore(documents, metadatas)(), access_level="employee"
+    )
+    hr_retriever = retriever_module.create_hybrid_retriever(
+        _fake_vectorstore(documents, metadatas)(), access_level="hr"
+    )
+
+    assert all("Confidential" not in doc.page_content for doc in employee_retriever.invoke("compensation"))
+    assert any("Confidential" in doc.page_content for doc in hr_retriever.invoke("compensation"))
+
+
+def test_web_search_tool_uses_tavily(monkeypatch):
+    from src.web_search_tool import WebSearchTool
+
+    monkeypatch.setenv("TAVILY_API_KEY", "test-tavily")
+    monkeypatch.setenv("SERPER_API_KEY", "test-serper")
+    calls = _stub_post(monkeypatch, {
+        "results": [{"title": "IRS", "url": "https://irs.gov/401k", "content": "Public limit"}]
+    })
+    result = WebSearchTool().run("IRS 401(k) limits")
+
+    assert calls[0][0] == "https://api.tavily.com/search"
+    assert calls[0][1]["json"]["api_key"] == "test-tavily"
+    assert result.documents[0].page_content == "Public limit"
+    assert result.documents[0].metadata == {
+        "source": "web:https://irs.gov/401k", "title": "IRS"
+    }
+
+
+def test_web_search_tool_uses_serper_when_tavily_key_is_missing(monkeypatch):
+    from src.web_search_tool import WebSearchTool
+
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setenv("SERPER_API_KEY", "test-serper")
+    calls = _stub_post(monkeypatch, {
+        "organic": [{"title": "Labor law", "link": "https://dol.gov/rule", "snippet": "Public rule"}]
+    })
+    result = WebSearchTool().run("public labor law")
+
+    assert calls[0][0] == "https://google.serper.dev/search"
+    assert calls[0][1]["headers"]["X-API-KEY"] == "test-serper"
+    assert result.documents[0].metadata == {
+        "source": "web:https://dol.gov/rule", "title": "Labor law"
+    }
+
+
+def test_web_search_tool_is_empty_when_no_provider_key_is_set(monkeypatch, caplog):
+    from src.web_search_tool import WebSearchTool
+
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+    with caplog.at_level(logging.WARNING):
+        result = WebSearchTool().run("public question")
+
+    assert result.documents == []
+    assert "no Tavily or Serper API key" in caplog.text
+
+
+def test_web_search_route_adds_web_documents_to_retrieval_context(monkeypatch):
+    retriever = FakeRetriever()
+    agent = RAGAgent(None, retriever, "EMP00001", FakeLLM(route="WEB_SEARCH"))
+    chain = FakeChain(agent.context_retriever)
+    agent.chain = chain
+    web_document = Document(
+        page_content="Public IRS limit information",
+        metadata={"source": "web:https://irs.gov/limits", "title": "IRS limits"},
+    )
+    monkeypatch.setattr(
+        agent.web_search_tool,
+        "run",
+        lambda _question: ToolResult("web_search", [web_document], None),
+    )
+
+    result = query_rag(agent, "What are the public IRS contribution limits?")
+
+    assert any(
+        doc.page_content == "Public IRS limit information"
+        for doc in chain.retrieved_documents
+    )
+    assert "web:https://irs.gov/limits" in result["sources"]
+    assert result["tools_used"] == ["hybrid_retriever", "web_search"]

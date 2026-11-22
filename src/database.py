@@ -1,9 +1,7 @@
-"""SQLite schema setup and employee/knowledge queries."""
+"""SQLite schema setup and employee queries."""
 
 import calendar
-import os
 import random
-import re
 import sqlite3
 from contextlib import closing
 from datetime import date
@@ -85,23 +83,6 @@ KNOWLEDGE_SEED = [
      "The stipend is paid within 30 days of the remote designation being confirmed in Workday. "
      "Receipts are not required for the monthly allowance; the one-time stipend requires receipts."),
 ]
-
-
-def ensure_knowledge_base() -> None:
-    """Create and seed the curated company-knowledge table."""
-    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS rag_knowledge (
-                key TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                content TEXT NOT NULL
-            )
-        """)
-        conn.executemany(
-            "INSERT OR IGNORE INTO rag_knowledge (key, title, content) VALUES (?, ?, ?)",
-            KNOWLEDGE_SEED,
-        )
-        conn.commit()
 
 
 def _seed_expense_claims(
@@ -309,6 +290,7 @@ def init_db() -> None:
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         cur = conn.cursor()
         cur.execute("DROP TABLE IF EXISTS employees")
+        cur.execute("DROP TABLE IF EXISTS rag_knowledge")
 
         column_definitions = []
         for column in df.columns:
@@ -344,7 +326,6 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_emp_id ON employees(id)")
         conn.commit()
 
-    ensure_knowledge_base()
     ensure_transactional_tables()
     print(f"Loaded {len(df)} employees into SQLite: {DB_PATH}")
 
@@ -361,25 +342,3 @@ def get_employee(employee_id: str) -> dict | None:
     employee = dict(row)
     employee.pop("password_hash", None)
     return employee
-
-
-def search_knowledge(query: str, limit: int = 3) -> list[dict]:
-    """Return curated knowledge rows matching words in the query."""
-    if not os.path.exists(DB_PATH):
-        return []
-    terms = [term for term in re.findall(r"[a-z0-9]+", query.lower()) if len(term) > 2]
-    if not terms:
-        return []
-
-    clauses = " OR ".join("lower(title || ' ' || content) LIKE ?" for _ in terms)
-    params = [f"%{term}%" for term in terms] + [limit]
-    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
-        conn.row_factory = sqlite3.Row
-        try:
-            rows = conn.execute(
-                f"SELECT key, title, content FROM rag_knowledge WHERE {clauses} LIMIT ?",
-                params,
-            ).fetchall()
-        except sqlite3.OperationalError:
-            rows = []
-    return [dict(row) for row in rows]

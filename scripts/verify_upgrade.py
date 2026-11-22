@@ -52,10 +52,6 @@ def main() -> None:
         assert len({value[7:29] for value in hashes}) == 2000, "Employee bcrypt salts are not unique"
         print("[OK] 2000 unique bcrypt salts")
 
-        knowledge_count = conn.execute("SELECT count(*) FROM rag_knowledge").fetchone()[0]
-        assert knowledge_count >= 12, f"Only {knowledge_count} rows in rag_knowledge"
-        print(f"[OK] rag_knowledge has {knowledge_count} rows")
-
         employee_schema = conn.execute("PRAGMA table_info(employees)").fetchall()
         employee_columns = [row[1] for row in employee_schema]
         assert all(column in employee_columns for column in [

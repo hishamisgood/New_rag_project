@@ -25,11 +25,14 @@ matplotlib.use("Agg")  # non-interactive backend
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from PIL import Image, ImageDraw, ImageFont
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
     Image as RLImage, PageBreak, HRFlowable,
@@ -117,6 +120,196 @@ def _new_doc(filename: str) -> tuple[str, SimpleDocTemplate]:
         bottomMargin=0.75 * inch,
     )
     return path, doc
+
+
+def _scan_font(size: int, bold: bool = False):
+    names = [
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for name in names:
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _draw_scan_text(draw, text: str, x: int, y: int, font, max_width: int, line_gap: int = 12):
+    words = text.split()
+    line = ""
+    for word in words:
+        candidate = f"{line} {word}".strip()
+        if line and draw.textbbox((0, 0), candidate, font=font)[2] > max_width:
+            draw.text((x, y), line, fill=(35, 35, 35), font=font)
+            y += font.size + line_gap
+            line = word
+        else:
+            line = candidate
+    if line:
+        draw.text((x, y), line, fill=(35, 35, 35), font=font)
+        y += font.size + line_gap
+    return y
+
+
+def _draw_scan_table(draw, table: list[list[str]], margin: int, width: int, y: int) -> int:
+    if not table:
+        return y
+    cell_width = (width - margin * 2) // len(table[0])
+    font = _scan_font(26)
+    for row_number, row in enumerate(table):
+        top, bottom = y, y + 64
+        fill = (222, 231, 228) if row_number == 0 else (247, 246, 240)
+        draw.rectangle((margin, top, width - margin, bottom), fill=fill,
+                       outline=(125, 133, 130), width=2)
+        for col_number, cell in enumerate(row):
+            left = margin + col_number * cell_width
+            draw.text((left + 12, top + 16), str(cell)[:26],
+                      fill=(30, 30, 30), font=font)
+            if col_number:
+                draw.line((left, top, left, bottom), fill=(125, 133, 130), width=2)
+        y = bottom
+    return y
+
+
+def _draw_scan_stamp(draw, width: int, height: int, margin: int, stamp: str) -> None:
+    box = (margin, height - 410, margin + 760, height - 280)
+    draw.rectangle(box, outline=(153, 59, 50), width=7)
+    draw.text((margin + 24, height - 382), stamp, fill=(153, 59, 50),
+              font=_scan_font(38, bold=True))
+
+
+def _render_scanned_page_image(page_content: dict) -> Image.Image:
+    """Render a page as a slightly imperfect high-resolution scanned image."""
+    width, height = 2550, 3300
+    rng = np.random.default_rng(2026)
+    grain = rng.normal(0, 1.15, (height, width, 1))
+    paper = np.clip(np.full((height, width, 3), [249, 247, 239]) + grain, 0, 255)
+    image = Image.fromarray(paper.astype("uint8"), "RGB")
+    draw = ImageDraw.Draw(image)
+    margin = 190
+    y = 170
+    body_font = _scan_font(32)
+    title_font = _scan_font(48, bold=True)
+    y = _draw_scan_text(draw, page_content["title"], margin, y, title_font,
+                        width - margin * 2, line_gap=18)
+    draw.line((margin, y, width - margin, y), fill=(145, 153, 151), width=3)
+    y += 45
+
+    for paragraph in page_content.get("paragraphs", []):
+        y = _draw_scan_text(draw, paragraph, margin, y, body_font,
+                            width - margin * 2, line_gap=18) + 18
+
+    _draw_scan_table(draw, page_content.get("table", []), margin, width, y)
+    _draw_scan_stamp(draw, width, height, margin,
+                     page_content.get("stamp", "SIGNED / APPROVED"))
+    return image.rotate(0.4, resample=Image.Resampling.BICUBIC, expand=False,
+                        fillcolor=(249, 247, 239))
+
+
+def _render_scanned_pdf(output_path: str, pages_content: list[dict]) -> None:
+    """Create an image-only PDF; its pages contain no selectable text objects."""
+    pdf = canvas.Canvas(output_path, pagesize=letter)
+    for page_content in pages_content:
+        image = _render_scanned_page_image(page_content)
+        pdf.drawImage(ImageReader(image), 0, 0, width=letter[0], height=letter[1])
+        pdf.showPage()
+    pdf.save()
+
+
+def _append_scanned_page(pdf_path: str, page_content: dict) -> None:
+    from pypdf import PdfReader, PdfWriter
+
+    scan_pdf = io.BytesIO()
+    scan_canvas = canvas.Canvas(scan_pdf, pagesize=letter)
+    scan_canvas.drawImage(ImageReader(_render_scanned_page_image(page_content)),
+                          0, 0, width=letter[0], height=letter[1])
+    scan_canvas.save()
+    scan_pdf.seek(0)
+
+    writer = PdfWriter()
+    for page in PdfReader(pdf_path).pages:
+        writer.add_page(page)
+    writer.add_page(PdfReader(scan_pdf).pages[0])
+    merged = io.BytesIO()
+    writer.write(merged)
+    Path(pdf_path).write_bytes(merged.getvalue())
+
+
+def _long_table(rows: list[list[str]], widths: list[float], color: str,
+                row_height: float = 0.32 * inch) -> Table:
+    table = Table(rows, colWidths=widths, rowHeights=[0.36 * inch] +
+                  [row_height] * (len(rows) - 1), repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(color)),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("GRID", (0, 0), (-1, -1), 0.45, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f3f6f6")]),
+    ]))
+    return table
+
+
+def _coverage_matrix_rows() -> list[list[str]]:
+    regions = ["North America", "Europe", "Asia Pacific", "Latin America", "Middle East"]
+    plans = ["Standard", "Premium", "Family Plus", "Global Care", "Wellness Select"]
+    rows = [["Matrix ID", "Region", "Plan", "Primary Copay", "Wellness Credit", "Coverage Note"]]
+    for index in range(1, 76):
+        copay = 30 if index % 3 == 1 else 20 if index % 3 == 2 else 10
+        rows.append([
+            f"BEN-{index:03}", regions[(index - 1) % len(regions)],
+            plans[(index - 1) % len(plans)], f"${copay}",
+            f"${400 + (index % 7) * 100}",
+            "In-network annual review" if index != 63 else "Emergency waiver within 48 hours",
+        ])
+    return rows
+
+
+def _travel_schedule_rows() -> list[list[str]]:
+    regions = ["US East", "US West", "UK", "Germany", "Japan", "Singapore", "Brazil"]
+    tiers = ["Standard", "Manager", "Executive"]
+    rows = [["Schedule ID", "Destination", "Travel Tier", "Daily Per Diem", "Lodging Cap", "Control"]]
+    for index in range(1, 76):
+        rows.append([
+            f"TRV-{index:03}", regions[(index - 1) % len(regions)],
+            tiers[(index - 1) % len(tiers)], f"${85 + (index % 8) * 15}",
+            f"${180 + (index % 9) * 25}",
+            "Receipt required at $25+" if index != 68 else "Foreign currency converted on purchase date",
+        ])
+    return rows
+
+
+def _compensation_directory_rows() -> list[list[str]]:
+    roles = [
+        "Software Engineer", "Data Analyst", "Product Manager", "UX Designer",
+        "Security Engineer", "Technical Writer", "Finance Partner", "People Partner",
+        "Solutions Architect", "Machine Learning Engineer", "Customer Success Manager",
+        "Operations Analyst", "Research Scientist", "Staff Software Engineer",
+        "Director, Product", "Principal Security Engineer", "Senior Staff ML Engineer",
+        "Regional Sales Director", "Lead Data Platform Engineer", "VP, Customer Experience",
+    ]
+    locations = ["US", "Canada", "UK", "Germany", "Singapore"]
+    rows = [["Role Code", "Role Title", "Level", "Market", "Band Minimum", "Midpoint", "Band Maximum"]]
+    for index in range(1, 101):
+        base = 62000 + (index % 20) * 4300
+        if index == 87:
+            role, level, market, base = "Senior Staff ML Engineer", "L7", "US", 178000
+        else:
+            role = roles[(index - 1) % len(roles)]
+            level = f"L{(index - 1) % 7 + 1}"
+            market = locations[(index - 1) % len(locations)]
+        rows.append([
+            f"NC-{index:03}", role, level, market,
+            f"${base:,}", f"${base + 18000:,}", f"${base + 36000:,}",
+        ])
+    return rows
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -236,6 +429,18 @@ def generate_employee_handbook(df: pd.DataFrame | None):
         Each review consists of self-assessment, peer feedback (360°), manager evaluation,
         and a calibration session.
     """), STYLES["BodyJ"]))
+    story.append(Paragraph(textwrap.dedent("""\
+        Managers set goals at the start of each review period and explain how individual
+        results connect to team commitments. Employees receive a written outcome after
+        calibration and agree on development steps with their manager. A rating does not
+        guarantee a particular salary adjustment; final decisions also follow approved
+        budget, internal equity, and local employment requirements.
+        <br/><br/>
+        Concerns should first be raised with the manager within ten business days. If the
+        issue involves the manager or remains unresolved, an employee may request a
+        confidential People Partner review. Allegations of discrimination or retaliation
+        are escalated to Employee Relations for independent follow-up.
+    """), STYLES["BodyJ"]))
 
     perf_data = [
         ["Rating", "Label", "Description", "Salary Impact", "Bonus Range"],
@@ -265,6 +470,40 @@ def generate_employee_handbook(df: pd.DataFrame | None):
         <b>Time Tracking:</b> All employees must log their hours daily in the NovaCorp
         Time Portal. Persistent failure to log time may result in disciplinary action.
     """), STYLES["BodyJ"]))
+
+    story.append(PageBreak())
+    story.append(Paragraph("5. Global Travel Per-Diem, Lodging Cap & Expense Compliance Schedule",
+                           STYLES["SectionHead"]))
+    story.append(Paragraph(
+        "Use the destination and traveler tier to identify the daily meal per-diem and "
+        "nightly lodging cap. This 75-row schedule is repeated across pages with its "
+        "column headings on every continuation page.", STYLES["BodyJ"],
+    ))
+    travel_table = _long_table(
+        _travel_schedule_rows(),
+        [0.85*inch, 1.0*inch, 0.95*inch, 1.0*inch, 1.0*inch, 2.2*inch],
+        "#1b5e20", row_height=0.32*inch,
+    )
+    story.append(travel_table)
+    story.append(Paragraph(
+        "Itemized receipts are required for each expense of $25 or more; smaller tips "
+        "and transit fares may be grouped when local rules permit. The traveler must "
+        "submit the itemized record and business purpose within ten business days of return.",
+        STYLES["BodyJ"],
+    ))
+    story.append(Paragraph(
+        "For foreign-currency purchases, Finance converts the posted amount using the "
+        "card-network rate on the transaction date. Cash advances use the published "
+        "central-bank rate for the purchase date, with the rate source attached to the claim.",
+        STYLES["BodyJ"],
+    ))
+    story.append(Paragraph(
+        "Personal entertainment, companion travel, traffic fines, minibar purchases, and "
+        "upgrades chosen for convenience are not reimbursable. A travel disruption can "
+        "justify an exception only when the manager documents the business need before "
+        "submission; repeated exceptions are escalated to Finance Compliance.",
+        STYLES["BodyJ"],
+    ))
 
     doc.build(story)
     print(f"  📄 {path}")
@@ -390,6 +629,19 @@ def generate_onboarding_policy():
     t = Table(it_data, colWidths=[1.6*inch, 1.6*inch, 1.3*inch, 0.8*inch])
     t.setStyle(STD_TABLE_STYLE)
     story.append(t)
+    story.append(Paragraph(textwrap.dedent("""\
+        The manager and onboarding buddy review progress at days 7, 30, 60, and 90. A
+        required security, safety, or conduct module must be completed before independent
+        access to the related system is granted. If equipment or account access is delayed,
+        the new hire records the blocker in the onboarding checklist and the manager opens
+        an IT service request rather than sharing another employee's credentials.
+        <br/><br/>
+        An accommodation, leave, or immigration question should be referred to the People
+        Partner before a start date or assignment is changed. The People Partner coordinates
+        with Legal or Security when needed and gives the employee a written next step and
+        expected response date. Exceptions to the standard 30/60/90 schedule require a
+        documented manager reason and HR approval.
+    """), STYLES["BodyJ"]))
 
     doc.build(story)
     print(f"  📄 {path}")
@@ -518,6 +770,19 @@ def generate_rto_policy():
     t = Table(safety_data, colWidths=[1.5*inch, 2.5*inch, 1.3*inch])
     t.setStyle(STD_TABLE_STYLE)
     story.append(t)
+    story.append(Paragraph(textwrap.dedent("""\
+        Employees coordinate their office days with their team lead at the beginning of
+        each quarter. A team may designate shared anchor days for planning and mentoring,
+        while individual schedule changes remain available through the manager. Employees
+        working from another country must request separate approval before travel because
+        payroll, privacy, and immigration rules may differ by jurisdiction.
+        <br/><br/>
+        A medical accommodation or temporary safety concern can support a schedule exception.
+        Contact the People Partner with the requested dates and supporting details; managers
+        should not ask for unnecessary medical information. If a building issue prevents
+        safe access, Facilities may close a site and notify employees to work remotely until
+        the location is cleared.
+    """), STYLES["BodyJ"]))
 
     doc.build(story)
     print(f"  📄 {path}")
@@ -533,10 +798,11 @@ def generate_salary_report(df: pd.DataFrame | None):
     _title_page(story, "Salary Bands &\nCompensation Report")
 
     if df is None:
-        story.append(Paragraph("Data not available. Run generate_employees.py first.",
-                               STYLES["BodyJ"]))
-        doc.build(story)
-        return
+        df = pd.DataFrame({
+            "department": ["Engineering", "Product", "Finance", "Human Resources"],
+            "salary": [118000, 104000, 92000, 88000],
+            "years_of_expertise": [6, 4, 8, 5],
+        })
 
     # Avg salary by department bar chart
     story.append(Paragraph("1. Average Salary by Department", STYLES["SectionHead"]))
@@ -626,6 +892,31 @@ def generate_salary_report(df: pd.DataFrame | None):
     t.setStyle(STD_TABLE_STYLE)
     story.append(t)
     story.append(Spacer(1, 0.3*inch))
+
+    story.append(PageBreak())
+    story.append(Paragraph("5. Role-by-Role Compensation & Equity Band Directory",
+                           STYLES["SectionHead"]))
+    story.append(Paragraph(textwrap.dedent("""\
+        The directory uses a consistent job architecture and market reference date of
+        October 2026. Compensation analysts match each role to scope, decision authority,
+        skills, and sustained impact before assigning a level; geographic differentials
+        are then applied to the market midpoint. Minimum and maximum values represent
+        approved base-pay ranges and do not include bonus, equity awards, or benefits.
+        <br/><br/>
+        Equity reviews compare employees performing substantially similar work while
+        accounting for relevant experience, documented performance, and location. Proposed
+        offers outside the listed range require written justification, budget confirmation,
+        and review by the People Compensation team before a recruiter makes a commitment.
+    """), STYLES["BodyJ"]))
+    story.append(_long_table(
+        _compensation_directory_rows(),
+        [0.65*inch, 2.0*inch, 0.6*inch, 0.65*inch, 1.0*inch, 1.0*inch, 1.1*inch],
+        "#4a148c", row_height=0.31*inch,
+    ))
+    story.append(Paragraph(
+        "Footnote: Salary bands are internal planning ranges, not guarantees or individual pay disclosures.",
+        STYLES["BodyJ"],
+    ))
 
     # Salary by dept+seniority heatmap (complex chart → OCR)
     story.append(Paragraph("4. Salary Heatmap: Department × Experience",
@@ -785,6 +1076,39 @@ def generate_benefits_guide():
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     story.append(_fig_to_rl_image(fig, width=6*inch, height=3.3*inch))
+
+    story.append(PageBreak())
+    story.append(Paragraph("6. Global Benefits, Copay & Wellness Coverage Matrix",
+                           STYLES["SectionHead"]))
+    story.append(Paragraph(
+        "Use the region and plan tier to compare routine coverage and annual wellness "
+        "credits. Enrollment is available to eligible employees and dependents during "
+        "the annual election window or after a qualifying life event.", STYLES["BodyJ"],
+    ))
+    story.append(_long_table(
+        _coverage_matrix_rows(),
+        [0.8*inch, 1.05*inch, 1.0*inch, 1.0*inch, 1.0*inch, 2.15*inch],
+        "#00695c", row_height=0.32*inch,
+    ))
+    story.append(Paragraph(
+        "A marriage, birth, adoption, loss of other coverage, or qualifying relocation "
+        "opens a 30-day election window. Submit the event record through the Benefits "
+        "Portal; coverage changes take effect on the event date when submitted on time.",
+        STYLES["BodyJ"],
+    ))
+    story.append(Paragraph(
+        "If a claim is denied, request an internal appeal within 60 days and include the "
+        "explanation of benefits, relevant receipts, and any clinical documentation. The "
+        "Benefits team acknowledges an appeal within five business days and sends a written "
+        "decision or status update within 30 days.", STYLES["BodyJ"],
+    ))
+    story.append(Paragraph(
+        "Subtle emergency exception: when an out-of-network emergency makes advance "
+        "authorization impracticable, notify the insurer and NovaCorp Benefits within "
+        "48 hours after stabilization. The pre-authorization requirement is waived for "
+        "that emergency episode, but routine follow-up care still needs approval.",
+        STYLES["BodyJ"],
+    ))
 
     doc.build(story)
     print(f"  📄 {path}")
@@ -969,9 +1293,102 @@ def generate_leave_report(df: pd.DataFrame | None):
         by phone or Slack immediately. Submit the formal request within 48 hours of your
         return.
     """), STYLES["BodyJ"]))
+    story.append(Paragraph(textwrap.dedent("""\
+        Employees should submit planned leave as soon as dates are known so teams can arrange
+        coverage. Managers review eligibility, accrued balance, and operational coverage in
+        that order, then record an approval or a specific reason for denial. Requests longer
+        than five consecutive workdays also go to the HR Partner; protected leave is handled
+        under applicable local law when that law provides greater protection.
+        <br/><br/>
+        If a request is urgent, tell the manager by phone or the on-call channel and submit
+        the portal form as soon as reasonably possible. A disagreement about an eligibility
+        decision may be escalated to the People Partner, who should acknowledge it within
+        two business days. Medical details are kept in the restricted leave file and are not
+        shared with the wider team.
+    """), STYLES["BodyJ"]))
 
     doc.build(story)
     print(f"  📄 {path}")
+    _append_scanned_page(path, {
+        "title": "2026 Executive Leave Policy Sign-Off & Bereavement Addendum",
+        "paragraphs": [
+            "Effective October 1, 2026. This signed addendum supersedes the earlier "
+            "bereavement entitlement where the employee is eligible for the greater benefit.",
+            "Employees receive 10 paid bereavement days following the death of an immediate "
+            "family member and 5 paid days for an extended family member. Notify the manager "
+            "as soon as practical; documentation is requested only when needed to administer leave.",
+        ],
+        "table": [
+            ["Relationship", "Paid Days", "Approval Contact"],
+            ["Immediate family", "10", "People Manager"],
+            ["Extended family", "5", "People Manager"],
+        ],
+        "stamp": "SIGNED / APPROVED",
+    })
+
+
+def generate_scanned_documents() -> None:
+    remote_path = os.path.join(DOCS_DIR, "scanned_remote_work_addendum_2026.pdf")
+    _render_scanned_pdf(remote_path, [
+        {
+            "title": "Signed 2026 Executive Addendum — International Temporary Remote Work",
+            "paragraphs": [
+                "Effective October 1, 2026. Eligible employees may work temporarily from an "
+                "approved country for a maximum of 30 calendar days per calendar year.",
+                "Submit the request to the manager and People Operations at least 14 days "
+                "prior to departure. Approval must be written and must cover the destination, "
+                "dates, work duties, and data-handling plan.",
+            ],
+            "table": [
+                ["Approved country", "Country", "Approval"],
+                ["Canada", "Germany", "Required"],
+                ["France", "Japan", "Required"],
+                ["Netherlands", "Singapore", "Required"],
+                ["United Kingdom", "Australia", "Required"],
+            ],
+            "stamp": "SIGNED / APPROVED",
+        },
+        {
+            "title": "International Remote Work — Equipment and Compliance",
+            "paragraphs": [
+                "The employee remains subject to security, privacy, tax, payroll, and "
+                "immigration controls for the destination. NovaCorp may shorten or revoke "
+                "an approval if local law or client obligations require an earlier return.",
+                "This addendum replaces the older 2025 ergonomic allowance: an employee "
+                "with an approved international remote-work request may receive a $150 "
+                "ergonomic chair top-up once per calendar year. Submit the receipt within "
+                "30 days of purchase; no other furniture is covered by this top-up.",
+            ],
+            "table": [
+                ["Requirement", "Rule"],
+                ["Annual international limit", "30 calendar days"],
+                ["Request lead time", "14 days before departure"],
+                ["Chair top-up", "$150; supersedes 2025 allowance"],
+            ],
+            "stamp": "SIGNED / APPROVED",
+        },
+    ])
+
+    audit_path = os.path.join(DOCS_DIR, "scanned_hr_audit_memo_2026.pdf")
+    _render_scanned_pdf(audit_path, [{
+        "title": "Confidential HR Compensation Audit Memo — Q4 2026",
+        "paragraphs": [
+            "The Q4 2026 merit pool is 4.5% of eligible base payroll. Business-unit "
+            "allocations must be supported by calibrated performance records and reviewed "
+            "for internal equity before an offer or adjustment is communicated.",
+            "Any executive compensation adjustment at $180,000 or more requires written "
+            "VP of People approval before final sign-off. Finance records the approved "
+            "decision and the compensation team retains the audit trail in the restricted file.",
+        ],
+        "table": [
+            ["Control", "Threshold", "Approval"],
+            ["Q4 merit pool", "4.5%", "Compensation Committee"],
+            ["Executive adjustment", "$180,000+", "VP of People"],
+        ],
+        "stamp": "CONFIDENTIAL — SIGNED / APPROVED",
+    }])
+    print(f"  📄 {remote_path}")
+    print(f"  📄 {audit_path}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -993,7 +1410,8 @@ def main():
     generate_salary_report(df)
     generate_benefits_guide()
     generate_leave_report(df)
-    print("\n✅ All 6 documents generated in data/documents/")
+    generate_scanned_documents()
+    print("\n✅ Six policy PDFs and scanned addenda generated in data/documents/")
 
 
 if __name__ == "__main__":

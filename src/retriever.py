@@ -1,5 +1,5 @@
 """Embeddings, ChromaDB storage, and hybrid retrieval."""
-
+import time
 import logging
 import os
 from typing import Any
@@ -38,15 +38,25 @@ def get_embeddings() -> SafeGoogleGenerativeAIEmbeddings:
 
 
 def build_vectorstore(chunks: list[Document]) -> Chroma:
-    """Replace the persistent collection with the supplied document chunks."""
+    """Create (or overwrite) the ChromaDB vector store on disk."""
+    embeddings = get_embeddings()
     vectorstore = Chroma(
         collection_name=COLLECTION_NAME,
         persist_directory=CHROMA_DIR,
-        embedding_function=get_embeddings(),
+        embedding_function=embeddings,
     )
     vectorstore.reset_collection()
-    vectorstore.add_documents(chunks)
-    print(f"Stored {vectorstore._collection.count()} vectors in {CHROMA_DIR}")
+
+    batch_size = 80
+    total_batches = (len(chunks) + batch_size - 1) // batch_size
+    for idx, start in enumerate(range(0, len(chunks), batch_size), start=1):
+        batch = chunks[start:start + batch_size]
+        print(f"Embedding batch {idx}/{total_batches} ({len(batch)} chunks)...")
+        vectorstore.add_documents(batch)
+        if start + batch_size < len(chunks):
+            print("Waiting 65s for Gemini free-tier embedding rate limit...")
+            time.sleep(65)
+
     return vectorstore
 
 
